@@ -1301,109 +1301,330 @@ def generate_content_excel(campaign_plan: Dict[str, Any], writer, plan_ Dict[str
                     
 def generate_approved_plan_overview_excel(campaign_plan: Dict[str, Any], writer) -> None:
     overview_data = []
-    for platform, weeks in campaign_plan.items():
-        if should_skip_platform(platform, weeks):
-            continue
-        for week_key, days in weeks.items():
-            for day_key, day_data in days.items():
-                task_content = clean_task_content(day_data.get('task', ''), platform, day_key)
-                if not task_content or is_error_content(task_content):
-                    continue
-                overview_data.append({
-                    'Platform': platform.title(),
-                    'Week': week_key.replace('_', ' ').title(),
-                    'Day': day_key.replace('_', ' '),
-                    'Task': task_content,
-                    'Status': 'Approved'
-                })
-    if overview_
-        df_overview = pd.DataFrame(overview_data)
-        sheet_name = 'Approved Campaign Plan'
-        df_overview.to_excel(writer, sheet_name=sheet_name, index=False)
-        ws = writer.sheets[sheet_name]
-        enable_wrap_text(ws)
-        auto_adjust_column_widths(ws)
-    else:
-        # Add dummy sheet if no data
-        pd.DataFrame([{'Note': 'No approved plan data available'}]).to_excel(writer, sheet_name='Approved Campaign Plan', index=False)
-        
-def generate_full_campaign_plan_excel(campaign_plan: Dict[str, Any], writer, plan_ Dict[str, Any] = None) -> None:  # Added plan_data param
-    """Generate full approved campaign plan with Task, Content, Images, Feedback, Regeneration Count, and Status."""
-    full_data = []
-    for platform, weeks in campaign_plan.items():
-        for week_key, days in weeks.items():
-            for day_key, day_data in days.items():
-                post_id = f"{platform}_{week_key}_{day_key}"  # Compute post_id for lookup
-                task_content = clean_task_content(day_data.get('task', ''), platform, day_key)
-                if not task_content or is_error_content(task_content):
-                    continue
-                clean_content, image_paths = extract_content_and_images(day_data.get('content', ''))
-                stored_image_paths = day_data.get('image_path_s3', [])
-                if isinstance(stored_image_paths, list):
-                    all_image_paths = image_paths + stored_image_paths
-                else:
-                    all_image_paths = image_paths + [stored_image_paths] if stored_image_paths else image_paths
-                
-                # Get human feedback and regen count from plan_data if available, else fallback
-                human_feedback = plan_data.get('human_feedback_map', {}).get(post_id, day_data.get('human_feedback', ''))
-                regen_attempts = plan_data.get('regen_attempts_map', {}).get(post_id, day_data.get('regeneration_count', 0))
-                
-                full_data.append({
-                    'Platform': platform.title(),
-                    'Week': week_key.replace('_', ' ').title(),
-                    'Day': day_key.replace('_', ' '),
-                    'Task': task_content,
-                    'Content': clean_content,
-                    'Image Paths': '\n'.join(all_image_paths) if all_image_paths else '',
-                    'Human Feedback': human_feedback,  # Updated to use map
-                    'Regeneration Count': regen_attempts,  # Updated to use map
-                    'Status': day_data.get('status', 'Approved')
-                })
-    if full_
-        df_full = pd.DataFrame(full_data)
-        sheet_name = 'Full Campaign Plan'
-        df_full.to_excel(writer, sheet_name=sheet_name, index=False)
-        ws = writer.sheets[sheet_name]
-        enable_wrap_text(ws)
-        auto_adjust_column_widths(ws)
-    else:
-        # Add dummy sheet if no data
-        pd.DataFrame([{'Note': 'No full campaign data available'}]).to_excel(writer, sheet_name='Full Campaign Plan', index=False)
-        
-def generate_combined_excel(campaign_plan: Dict[str, Any], campaign_name: str, plan_ Dict[str, Any] = None) -> bytes:
-    """
-    Create a combined workbook: Approved Overview + Full Campaign Plan + Content sheets.
-    """
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        generate_approved_plan_overview_excel(campaign_plan, writer)
-        generate_full_campaign_plan_excel(campaign_plan, writer, plan_data)  # Pass plan_data
-        generate_content_excel(campaign_plan, writer, plan_data)  # Pass plan_data
-    output.seek(0)
-    return output.read()
-
+    
+    
+    
+    
+    #excel_generator.py:
+ 
+import pandas as pd
+from typing import Dict, Any
+import boto3
+from datetime import datetime
+import io
+import re
+from utils.env_vars import *
+from openpyxl.styles import Alignment
+ 
+# Initialize S3 client using environment variables
+s3_client = boto3.client('s3', region_name=AWS_REGION)
+ 
+# Use the environment variable for S3 bucket name
+S3_BUCKET = AWS_AGENTIC_BUCKET
+ 
+# =====================HELPER FUNCTIONS====================
+def is_error_content(content: str) -> bool:
+    """Check if content contains error messages."""
+    error_patterns = [
+        r'error',
+        r'throttlingexception',
+        r'no agent found'
+    ]
+    for pattern in error_patterns:
+        if re.search(pattern, content, re.IGNORECASE):
+            return True
+    return False
+ 
+ 
+def should_skip_platform(platform: str, weeks: Dict[str, Any]) -> bool:
+    """Check if a platform should be skipped (e.g., all tasks are 'No agent found')."""
+    for week_key, days in weeks.items():
+        for day_key, day_data in days.items():
+            if not is_error_content(day_data.get('task', '')):
+                return False
+    return True
+ 
+ 
+def clean_task_content(content: str, platform: str, day_key: str) -> str:
+    """Clean and format task content."""
+    # Remove redundant quotes
+    content = content.strip('"').strip("'")
+    # Capitalize first letter
+    if content:
+        content = content[0].upper() + content[1:]
+    return content
+ 
+ 
+def extract_content_and_images(content: str) -> tuple:
+    """
+    Extract clean content and image paths from mixed content.
+    """
+    if not content:
+        return "", []
+   
+    # Patterns to identify image descriptions
+    image_patterns = [
+        r'\*\*Image:\*\*[^\n]*',
+        r'\*\*Visuals:\*\*[^\n]*',
+        r'\(Image:[^)]*\)',
+        r'\(Visuals:[^)]*\)',
+        r'Image:[^\n]*',
+        r'Visuals:[^\n]*'
+    ]
+   
+    image_paths = []
+    clean_content = content
+   
+    # Extract image descriptions
+    for pattern in image_patterns:
+        matches = re.findall(pattern, content, re.IGNORECASE)
+        for match in matches:
+            # Clean up the image description
+            image_desc = re.sub(r'\*\*|Image:|Visuals:|\(|\)', '', match).strip()
+            if image_desc:
+                image_paths.append(image_desc)
+            # Remove from content
+            clean_content = re.sub(re.escape(match), '', clean_content)
+   
+    # Clean up the content
+    clean_content = re.sub(r'\n\s*\n', '\n\n', clean_content)  # Remove extra newlines
+    clean_content = clean_content.strip()
+   
+    return clean_content, image_paths
+ 
+def enable_wrap_text(ws):
+   """Enable wrap text for cells with multi-line content."""
+   for row in ws.iter_rows():
+       for cell in row:
+           if isinstance(cell.value, str) and "\n" in cell.value:
+               cell.alignment = Alignment(wrap_text=True)
+ 
+def auto_adjust_column_widths(ws):
+   """Auto-adjust column widths based on cell content length."""
+   for col in ws.columns:
+       max_length = 0
+       col_letter = col[0].column_letter
+       for cell in col:
+           try:
+               if cell.value:
+                   length = len(str(cell.value))
+                   if length > max_length:
+                       max_length = length
+           except Exception:
+               pass
+       ws.column_dimensions[col_letter].width = min(max_length + 2, 60)  # cap width
+ 
+# =====================FILE MANAGEMENT FUNCTIONS====================
+def upload_excel_to_s3(excel_content: bytes, s3_key: str, bucket: str) -> str:
+    """
+    Upload Excel file content to S3.
+    """
+    try:
+        s3_client = boto3.client('s3')
+       
+        s3_client.put_object(
+            Bucket=bucket,
+            Key=s3_key,
+            Body=excel_content,
+            ContentType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        )
+       
+        # Return S3 URL
+        return f"s3://{bucket}/{s3_key}"
+       
+    except Exception as e:
+        print(f"Error uploading to S3: {e}")
+        return ""
+ 
+# =====================EXCEL GENERATION FUNCTIONS====================
+def generate_campaign_excel(campaign_plan: Dict[str, Any], campaign_name: str, stage: str = "plan") -> bytes:
+    """
+    Generate Excel file from campaign plan data.
+    """
+    # Create Excel writer with multiple sheets
+    output = io.BytesIO()
+   
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+       
+        if stage == "draft" or stage == "plan":
+            # Generate plan overview Excel for draft stage
+            generate_plan_overview_excel(campaign_plan, writer)
+        else:
+            # Generate full content Excel for final stage
+            generate_content_excel(campaign_plan, writer)
+   
+    output.seek(0)
+    return output.read()
+ 
+def generate_plan_overview_excel(campaign_plan: Dict[str, Any], writer) -> None:
+    """Generate Excel sheets for plan overview stage (DRAFT)."""
+ 
+    # Create overview data for DRAFT stage - only basic columns
+    overview_data = []
+ 
+    for platform, weeks in campaign_plan.items():
+        # Skip platforms with no valid agents
+        if should_skip_platform(platform, weeks):
+            continue
+ 
+        for week_key, days in weeks.items():
+            for day_key, day_data in days.items():
+                task_content = clean_task_content(day_data.get('task', ''), platform, day_key)
+ 
+                # Skip entries with errors or no valid content
+                if not task_content or is_error_content(task_content):
+                    continue
+ 
+                overview_data.append({
+                    'Platform': platform.title(),
+                    'Week': week_key.replace('_', ' ').title(),
+                    'Day': day_key.replace('_', ' '),
+                    'Task': task_content,
+                    'Status': 'Pending Approval'
+                })
+ 
+    # Create DataFrame and save to Excel with "Campaign Plan" sheet name
+    if overview_data:
+        df_overview = pd.DataFrame(overview_data)
+        df_overview.to_excel(writer, sheet_name='Campaign Plan', index=False)
+ 
+def generate_content_excel(campaign_plan: Dict[str, Any], writer) -> None:
+    for platform, weeks in campaign_plan.items():
+        content_data = []
+        for week_key, days in weeks.items():
+            for day_key, day_data in days.items():
+                raw_content = day_data.get('content', '')
+                clean_content, image_paths = extract_content_and_images(raw_content)
+                stored_image_paths = day_data.get('image_path_s3', [])
+                if isinstance(stored_image_paths, list):
+                    all_image_paths = image_paths + stored_image_paths
+                else:
+                    all_image_paths = image_paths + [stored_image_paths] if stored_image_paths else image_paths
+                content_data.append({
+                    'Week': week_key.replace('_', ' ').title(),
+                    'Day': day_key.replace('_', ' '),
+                    'Task': day_data.get('task', ''),
+                    'Content': clean_content,
+                    'Image Paths': '\n'.join(all_image_paths) if all_image_paths else '',
+                    'Human Feedback': day_data.get('human_feedback', ''),   # ✅ simplified
+                    'Regeneration Count': day_data.get('regeneration_count', 0),
+                    'Status': 'Generated' if day_data.get('content') else 'Pending'
+                })
+        if content_data:
+            df_content = pd.DataFrame(content_data)
+            sheet_name = platform.title()
+            df_content.to_excel(writer, sheet_name=sheet_name, index=False)
+            ws = writer.sheets[sheet_name]
+            enable_wrap_text(ws)
+            auto_adjust_column_widths(ws)
+                       
+def generate_approved_plan_overview_excel(campaign_plan: Dict[str, Any], writer) -> None:
+    overview_data = []
+    for platform, weeks in campaign_plan.items():
+        if should_skip_platform(platform, weeks):
+            continue
+        for week_key, days in weeks.items():
+            for day_key, day_data in days.items():
+                task_content = clean_task_content(day_data.get('task', ''), platform, day_key)
+                if not task_content or is_error_content(task_content):
+                    continue
+                overview_data.append({
+                    'Platform': platform.title(),
+                    'Week': week_key.replace('_', ' ').title(),
+                    'Day': day_key.replace('_', ' '),
+                    'Task': task_content,
+                    'Status': 'Approved'
+                })
+    if overview_data:
+        df_overview = pd.DataFrame(overview_data)
+        sheet_name = 'Approved Campaign Plan'
+        df_overview.to_excel(writer, sheet_name=sheet_name, index=False)
+        ws = writer.sheets[sheet_name]
+        enable_wrap_text(ws)
+        auto_adjust_column_widths(ws)
+       
+def generate_full_campaign_plan_excel(campaign_plan: Dict[str, Any], writer) -> None:
+    """Generate full approved campaign plan with Task, Content, Images, Feedback, Regeneration Count, and Status."""
+    full_data = []
+    for platform, weeks in campaign_plan.items():
+        for week_key, days in weeks.items():
+            for day_key, day_data in days.items():
+                task_content = clean_task_content(day_data.get('task', ''), platform, day_key)
+                if not task_content or is_error_content(task_content):
+                    continue
+                clean_content, image_paths = extract_content_and_images(day_data.get('content', ''))
+                stored_image_paths = day_data.get('image_path_s3', [])
+                if isinstance(stored_image_paths, list):
+                    all_image_paths = image_paths + stored_image_paths
+                else:
+                    all_image_paths = image_paths + [stored_image_paths] if stored_image_paths else image_paths
+                full_data.append({
+                    'Platform': platform.title(),
+                    'Week': week_key.replace('_', ' ').title(),
+                    'Day': day_key.replace('_', ' '),
+                    'Task': task_content,
+                    'Content': clean_content,
+                    'Image Paths': '\n'.join(all_image_paths) if all_image_paths else '',
+                    'Human Feedback': day_data.get('human_feedback', ''),   # ✅ simplified
+                    'Regeneration Count': day_data.get('regeneration_count', 0),
+                    'Status': day_data.get('status', 'Approved')
+                })
+    if full_data:
+        df_full = pd.DataFrame(full_data)
+        sheet_name = 'Full Campaign Plan'
+        df_full.to_excel(writer, sheet_name=sheet_name, index=False)
+        ws = writer.sheets[sheet_name]
+        enable_wrap_text(ws)
+        auto_adjust_column_widths(ws)
+       
+def generate_combined_excel(campaign_plan: Dict[str, Any], campaign_name: str, plan_data: Dict[str, Any] = None) -> bytes:
+    """
+    Create a combined workbook: Approved Overview + Full Campaign Plan + Content sheets.
+    """
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        generate_approved_plan_overview_excel(campaign_plan, writer)
+        generate_full_campaign_plan_excel(campaign_plan, writer)
+        generate_content_excel(campaign_plan, writer)
+    output.seek(0)
+    return output.read()
+ 
 # =====================PUBLIC API FUNCTIONS====================
 def generate_and_upload_excel_to_s3(
-    campaign_plan: Dict[str, Any],
-    campaign_name: str,
-    stage: str,
-    bucket: str,
-    plan_ Dict[str, Any] = None,  # Added param
-    version: int = None  # Added param for versioning
+    campaign_plan: Dict[str, Any],
+    campaign_name: str,
+    stage: str,
+    bucket: str
 ) -> str:
-    """
-    Generate Excel file and upload directly to S3.
-    Supports plan_data for feedback/regen and version for file naming.
-    """
-    if stage in ["approved", "final"]:  # Use combined for approved/final stages
-        excel_content = generate_combined_excel(campaign_plan, campaign_name, plan_data)
-    else:
-        excel_content = generate_campaign_excel(campaign_plan, campaign_name, stage)
+    """
+    Generate Excel file and upload directly to S3.
+    """
+    excel_content = generate_campaign_excel(campaign_plan, campaign_name, stage)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    s3_key = f"campaigns/{campaign_name}/excel/{stage}_{timestamp}.xlsx"
+    s3_url = upload_excel_to_s3(excel_content, s3_key, bucket)
+    return s3_url
+ 
+def generate_and_upload_combined_excel_to_s3(
+    campaign_plan: Dict[str, Any],
+    campaign_name: str,
+    bucket: str,
+    plan_data: Dict[str, Any] = None,
+    version: int = 1
+    ) -> str:
+    """
+    Generate combined excel and upload with a versioned filename:
+    <username>_<campaign>_final_v{version}.xlsx
+    campaign_name should be the 'username/campaign_name' format to keep S3 path consistent.
+    """
+    # create excel bytes
+    excel_content = generate_combined_excel(campaign_plan, campaign_name, plan_data)
+    # sanitize name for filename; keep folder path intact in s3_key
+    clean_campaign_path = campaign_name.replace("/", "_")
+    filename = f"{clean_campaign_path}_final_v{version}.xlsx"
+    s3_key = f"campaigns/{campaign_name}/campaign_planner/excel/{filename}"
+    s3_url = upload_excel_to_s3(excel_content, s3_key, bucket)
+    return s3_url
     
-    # Versioned key with optional version suffix
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    version_suffix = f"_v{version}" if version else ""
-    s3_key = f"campaigns/{campaign_name}/excel/{stage}{version_suffix}_{timestamp}.xlsx"
-    s3_url = upload_excel_to_s3(excel_content, s3_key, bucket)
-    return s3_url
+          
 
