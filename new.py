@@ -1496,8 +1496,6 @@ def generate_and_upload_combined_excel_to_s3(
     return s3_url
     
           
-##System_agents.py:
- 
 from typing import Dict, Any
 from langchain_core.tools import tool
 from langchain_community.tools import DuckDuckGoSearchRun
@@ -1505,350 +1503,361 @@ from src.models import State
 from src.vectorDB import hybrid_search
 from src.llm.bedrock import call_bedrock_for_text
 from .social_media_agents import (
-    create_instagram_post, create_facebook_post, create_x_post,
-    create_whatsapp_post, create_email_post, create_sms_post
+    create_instagram_post, create_facebook_post, create_x_post,
+    create_whatsapp_post, create_email_post, create_sms_post
 )
- 
+
 # Mapping from platform name to agent function
 PLATFORM_AGENT_MAP = {
-    "instagram": create_instagram_post,
-    "facebook": create_facebook_post,
-    "x": create_x_post,
-    "whatsapp": create_whatsapp_post,
-    "email": create_email_post,
-    "sms": create_sms_post
+    "instagram": create_instagram_post,
+    "facebook": create_facebook_post,
+    "x": create_x_post,
+    "whatsapp": create_whatsapp_post,
+    "email": create_email_post,
+    "sms": create_sms_post
 }
- 
+
 def orchestrator_agent(state: State) -> Dict[str, Any]:
-    """
-    Main orchestrator agent that coordinates the entire workflow.
-    Determines if we're in plan generation or content generation stage.
-    """
-    # Check if plan is already approved and we need to generate content
-    if state.get("plan_approved") and state.get("stage") == "content_generation":
-        return {
-            "messages": ["Orchestrator: Starting content generation phase"],
-            "current_step": "orchestrator_agent",
-            "stage": "content_generation"
-        }
-    else:
-        # Default to plan generation stage
-        return {
-            "messages": ["Orchestrator: Starting campaign plan generation"],
-            "current_step": "orchestrator_agent",
-            "stage": "plan_generation"
-        }
- 
+    """
+    Main orchestrator agent that coordinates the entire workflow.
+    Determines if we're in plan generation or content generation stage.
+    """
+    if state.get("plan_approved") and state.get("stage") == "content_generation":
+        return {
+            "messages": ["Orchestrator: Starting content generation phase"],
+            "current_step": "orchestrator_agent",
+            "stage": "content_generation"
+        }
+    else:
+        return {
+            "messages": ["Orchestrator: Starting campaign plan generation"],
+            "current_step": "orchestrator_agent",
+            "stage": "plan_generation"
+        }
+
 def system_agent_orchestrator(state: State) -> Dict[str, Any]:
-    """
-    System agent orchestrator that manages system-level tasks.
-    """
-    return {
-        "messages": ["System agent orchestrator initialized"],
-        "current_step": "system_agent_orchestrator"
-    }
- 
- 
+    """
+    System agent orchestrator that manages system-level tasks.
+    """
+    return {
+        "messages": ["System agent orchestrator initialized"],
+        "current_step": "system_agent_orchestrator"
+    }
+
 def prompt_optimization(state: State) -> Dict[str, Any]:
-    """
-    Prompt optimization agent that optimizes prompts for content generation using vector database context.
-    Uses hybrid search to retrieve relevant context directly from the vector database.
-    """
-    campaign_objective = state.get("campaign_objective", "")
-    campaign_description = state.get("campaign_description", "")
-    target_audience = state.get("target_audience", "")
-    collection_name = state.get("collection_name", "default_collection")
-   
-    # Base prompt elements
-    base_prompt_elements = {
-        "objective": campaign_objective,
-        "description": campaign_description,
-        "audience": target_audience,
-        "theme": state.get("campaign_theme"),
-        "location": state.get("target_location", "Global")
-    }
-   
-    # Enhanced prompt elements using vector database and web search context
-    enhanced_prompt_elements = base_prompt_elements.copy()
-   
-    # Get web search results from state
-    web_search_results = state.get("search_results", "")
-   
-    # Create search query from campaign parameters
-    search_query = f"{campaign_objective} {campaign_description} {target_audience} campaign strategy content"
-   
-    try:
-        # Use hybrid search to get relevant context
-        search_result = hybrid_search(
-            query=search_query,
-            collection_name=collection_name,
-            n_results=5
-        )
-       
-        if search_result.get("success") and search_result.get("results"):
-            context_results = search_result["results"]
-            context_insights = [result["text"] for result in context_results if result.get("text")]
-            context_sources = [result["metadata"].get("source", "unknown") for result in context_results]
-           
-            # Create context-enhanced prompts
-            context_keywords = []
-           
-            # Analyze context insights for relevant keywords and themes
-            for insight in context_insights[:5]:  # Use top 5 insights
-                # Extract potential keywords (simplified approach)
-                words = insight.lower().split()
-                # Look for campaign-relevant terms
-                relevant_terms = [word for word in words if len(word) > 4 and
-                                any(keyword in word for keyword in ['campaign', 'brand', 'message', 'content', 'audience', 'strategy'])]
-                context_keywords.extend(relevant_terms[:2])  # Limit keywords per insight
-           
-            # Remove duplicates and limit total keywords
-            context_keywords = list(set(context_keywords))[:10]
-           
-            # Enhance prompt elements with context
-            if context_keywords:
-                enhanced_prompt_elements["context_keywords"] = context_keywords
-           
-            if web_search_results:
-                enhanced_prompt_elements["web_search_results"] = web_search_results
- 
-            if context_sources:
-                enhanced_prompt_elements["reference_sources"] = list(set(context_sources))[:3]  # Top 3 unique sources
-           
-            # Create context-aware prompt guidance
-            context_guidance = f"Incorporate insights from {len(context_insights)} relevant context sources and web search results"
-            if context_keywords:
-                context_guidance += f", focusing on themes related to: {', '.join(context_keywords[:5])}"
-           
-            enhanced_prompt_elements["context_guidance"] = context_guidance
-            enhanced_prompt_elements["context_insights"] = context_insights[:3]  # Store top 3 insights
-           
-            messages = [
-                "Prompt optimization completed with vector database and web search context integration",
-                f"Enhanced prompts with {len(context_insights)} context insights from {len(set(context_sources))} sources and web search results",
-                f"Extracted {len(context_keywords)} relevant keywords for content focus"
-            ]
-            context_enhanced = True
-        else:
-            # Fallback when no context is available
-            enhanced_prompt_elements["context_guidance"] = "Using campaign parameters only - no relevant context found in vector database"
-            if web_search_results:
-                 enhanced_prompt_elements["web_search_results"] = web_search_results
-            messages = [
-                "Prompt optimization completed using campaign parameters and web search results only",
-                "No relevant context found in vector database - using standard optimization approach with web search"
-            ]
-            context_enhanced = False
-           
-    except Exception as e:
-        # Handle any errors with hybrid search
-        enhanced_prompt_elements["context_guidance"] = "Using campaign parameters only - error accessing vector database"
-        messages = [
-            "Prompt optimization completed using campaign parameters only",
-            f"Error accessing vector database: {str(e)} - using standard optimization approach"
-        ]
-        context_enhanced = False
-   
-    return {
-        "messages": messages,
-        "current_step": "prompt_optimization",
-        "optimized_prompts": enhanced_prompt_elements,
-        "context_enhanced": context_enhanced
-    }
- 
+    """
+    Prompt optimization agent that optimizes prompts for content generation using vector database context.
+    Uses hybrid search to retrieve relevant context directly from the vector database.
+    """
+    campaign_objective = state.get("campaign_objective", "")
+    campaign_description = state.get("campaign_description", "")
+    target_audience = state.get("target_audience", "")
+    collection_name = state.get("collection_name", "default_collection")
+   
+    # Base prompt elements
+    base_prompt_elements = {
+        "objective": campaign_objective,
+        "description": campaign_description,
+        "audience": target_audience,
+        "theme": state.get("campaign_theme"),
+        "location": state.get("target_location", "Global")
+    }
+   
+    # Enhanced prompt elements using vector database and web search context
+    enhanced_prompt_elements = base_prompt_elements.copy()
+   
+    # Get web search results from state
+    web_search_results = state.get("search_results", "")
+   
+    # Create search query from campaign parameters
+    search_query = f"{campaign_objective} {campaign_description} {target_audience} campaign strategy content"
+   
+    try:
+        # Use hybrid search to get relevant context
+        search_result = hybrid_search(
+            query=search_query,
+            collection_name=collection_name,
+            n_results=5
+        )
+       
+        if search_result.get("success") and search_result.get("results"):
+            context_results = search_result["results"]
+            context_insights = [result["text"] for result in context_results if result.get("text")]
+            context_sources = [result["metadata"].get("source", "unknown") for result in context_results]
+           
+            context_keywords = []
+           
+            # Analyze context insights for relevant keywords and themes
+            for insight in context_insights[:5]:  # Use top 5 insights
+                # Extract potential keywords (simplified approach)
+                words = insight.lower().split()
+                # Look for campaign-relevant terms
+                relevant_terms = [word for word in words if len(word) > 4 and
+                                any(keyword in word for keyword in ['campaign', 'brand', 'message', 'content', 'audience', 'strategy'])]
+                context_keywords.extend(relevant_terms[:2])  # Limit keywords per insight
+           
+            # Remove duplicates and limit total keywords
+            context_keywords = list(set(context_keywords))[:10]
+           
+            # Enhance prompt elements with context
+            if context_keywords:
+                enhanced_prompt_elements["context_keywords"] = context_keywords
+           
+            if web_search_results:
+                enhanced_prompt_elements["web_search_results"] = web_search_results
+
+            if context_sources:
+                enhanced_prompt_elements["reference_sources"] = list(set(context_sources))[:3]  # Top 3 unique sources
+           
+            # Create context-aware prompt guidance
+            context_guidance = f"Incorporate insights from {len(context_insights)} relevant context sources and web search results"
+            if context_keywords:
+                context_guidance += f", focusing on themes related to: {', '.join(context_keywords[:5])}"
+           
+            enhanced_prompt_elements["context_guidance"] = context_guidance
+            enhanced_prompt_elements["context_insights"] = context_insights[:3]  # Store top 3 insights
+           
+            messages = [
+                "Prompt optimization completed with vector database and web search context integration",
+                f"Enhanced prompts with {len(context_insights)} context insights from {len(set(context_sources))} sources and web search results",
+                f"Extracted {len(context_keywords)} relevant keywords for content focus"
+            ]
+            context_enhanced = True
+        else:
+            # Fallback when no context is available
+            enhanced_prompt_elements["context_guidance"] = "Using campaign parameters only - no relevant context found in vector database"
+            if web_search_results:
+                 enhanced_prompt_elements["web_search_results"] = web_search_results
+            messages = [
+                "Prompt optimization completed using campaign parameters and web search results only",
+                "No relevant context found in vector database - using standard optimization approach with web search"
+            ]
+            context_enhanced = False
+           
+    except Exception as e:
+        # Handle any errors with hybrid search
+        enhanced_prompt_elements["context_guidance"] = "Using campaign parameters only - error accessing vector database"
+        messages = [
+            "Prompt optimization completed using campaign parameters only",
+            f"Error accessing vector database: {str(e)} - using standard optimization approach"
+        ]
+        context_enhanced = False
+   
+    return {
+        "messages": messages,
+        "current_step": "prompt_optimization",
+        "optimized_prompts": enhanced_prompt_elements,
+        "context_enhanced": context_enhanced
+    }
+
 def text_generator(state: State) -> Dict[str, Any]:
-    """
-    Text generation agent that creates text content.
-    """
-    optimized_prompts = state.get("optimized_prompts", {})
-   
-    # Create a detailed prompt for the LLM
-    prompt = f"""Generate content based on the following:
-   
-    Objective: {optimized_prompts.get('objective')}
-    Description: {optimized_prompts.get('description')}
-    Audience: {optimized_prompts.get('audience')}
-    Theme: {optimized_prompts.get('theme')}
-    Location: {optimized_prompts.get('location')}
-    Context Guidance: {optimized_prompts.get('context_guidance')}
-    Context Keywords: {', '.join(optimized_prompts.get('context_keywords', [])) if isinstance(optimized_prompts.get('context_keywords'), list) else optimized_prompts.get('context_keywords', '')}
-    Web Search Results: {optimized_prompts.get('web_search_results')}
-    """
-   
-    generated_text = call_bedrock_for_text(
-        prompt=prompt,
-        max_tokens=2000,
-        temperature=0.7
-    )
-   
-    return {
-        "messages": ["Text generation completed using AWS Bedrock"],
-        "current_step": "text_generator",
-        "generated_text": generated_text
-    }
- 
+    """
+    Text generation agent that creates text content.
+    """
+    optimized_prompts = state.get("optimized_prompts", {})
+   
+    # Create a detailed prompt for the LLM
+    prompt = f"""Generate content based on the following:
+   
+    Objective: {optimized_prompts.get('objective')}
+    Description: {optimized_prompts.get('description')}
+    Audience: {optimized_prompts.get('audience')}
+    Theme: {optimized_prompts.get('theme')}
+    Location: {optimized_prompts.get('location')}
+    Context Guidance: {optimized_prompts.get('context_guidance')}
+    Context Keywords: {', '.join(optimized_prompts.get('context_keywords', [])) if isinstance(optimized_prompts.get('context_keywords'), list) else optimized_prompts.get('context_keywords', '')}
+    Web Search Results: {optimized_prompts.get('web_search_results')}
+    """
+   
+    generated_text = call_bedrock_for_text(
+        prompt=prompt,
+        max_tokens=2000,
+        temperature=0.7
+    )
+   
+    return {
+        "messages": ["Text generation completed using AWS Bedrock"],
+        "current_step": "text_generator",
+        "generated_text": generated_text
+    }
+
 def image_generator(state: State) -> Dict[str, Any]:
-    """
-    Image generation agent that creates image content.
-    """
-    return {
-        "messages": ["Image generation completed"],
-        "current_step": "image_generator"
-    }
- 
+    """
+    Image generation agent that creates image content.
+    """
+    return {
+        "messages": ["Image generation completed"],
+        "current_step": "image_generator"
+    }
+
 def content_reviewer(state: State) -> Dict[str, Any]:
-    """
-    Content review agent that reviews generated content.
-    """
-    return {
-        "messages": ["Content review completed"],
-        "current_step": "content_reviewer"
-    }
- 
+    """
+    Content review agent that reviews generated content.
+    """
+    return {
+        "messages": ["Content review completed"],
+        "current_step": "content_reviewer"
+    }
+
 def content_formatter(state: State) -> Dict[str, Any]:
-    """
-    Content formatting agent that formats content for different platforms.
-    """
-    return {
-        "messages": ["Content formatting completed"],
-        "current_step": "content_formatter"
-    }
- 
+    """
+    Content formatting agent that formats content for different platforms.
+    """
+    return {
+        "messages": ["Content formatting completed"],
+        "current_step": "content_formatter"
+    }
+
 def plan_generator(state: State) -> Dict[str, Any]:
-    """
-    Plan generator agent that creates the initial campaign plan structure with AI-generated tasks.
-    This runs in stage 1 to generate the basic plan outline for approval.
-    """
-    base_plan = state.get("base_plan_dict", {})
-    platforms = state.get("platforms", ["instagram", "facebook", "x", "whatsapp", "email", "sms"])
-   
-    campaign_plan = {}
-    for platform in platforms:
-        campaign_plan[platform] = {}
-        for week_key, week_data in base_plan.items():
-            week_num = week_key.lower()
-            campaign_plan[platform][week_num] = {}
-            for day_index, day_info in enumerate(week_data):
-                day_key = f"Day_{day_index + 1}"
-                agent_f = PLATFORM_AGENT_MAP.get(platform)
-                if agent_f:
-                    agent_state = state.copy()
-                    agent_state["current_day"] = day_index + 1
-                    agent_state["total_days"] = len(week_data)
-                    try:
-                        result = agent_f(agent_state)
-                        post = result.get(f"{platform}_post")
-                        # For the plan, we just need the task description
-                        task_description = post.get('task_description') or f"AI-generated content for {platform}"
-                        campaign_plan[platform][week_num][day_key] = {
-                            "task": task_description
-                        }
-                    except Exception as e:
-                        campaign_plan[platform][week_num][day_key] = {
-                            "task": f"Error generating task: {str(e)}"
-                        }
-                else:
-                    campaign_plan[platform][week_num][day_key] = {
-                        "task": f"No agent found for {platform}"
-                    }
-   
-    return {
-        "messages": ["Campaign plan outline generated - awaiting approval"],
-        "current_step": "plan_generator",
-        "campaign_plan": campaign_plan,
-        "stage": "plan_generation"
-    }
- 
+    """
+    Plan generator agent that creates the initial campaign plan structure with AI-generated tasks.
+    This runs in stage 1 to generate the basic plan outline for approval.
+    """
+    base_plan = state.get("base_plan_dict", {})
+    platforms = state.get("platforms", ["instagram", "facebook", "x", "whatsapp", "email", "sms"])
+   
+    # ✅ FIXED: Create correct structure - each platform at root level
+    campaign_plan = {}
+    
+    for platform in platforms:
+        campaign_plan[platform] = {}  # Each platform at root level
+        
+        for week_key, week_data in base_plan.items():
+            week_num = week_key.lower()
+            campaign_plan[platform][week_num] = {}
+            
+            for day_index, day_info in enumerate(week_data):
+                day_key = f"Day_{day_index + 1}"
+                agent_f = PLATFORM_AGENT_MAP.get(platform)
+                
+                if agent_f:
+                    agent_state = state.copy()
+                    agent_state["current_day"] = day_index + 1
+                    agent_state["total_days"] = len(week_data)
+                    try:
+                        result = agent_f(agent_state)
+                        post = result.get(f"{platform}_post")
+                        task_description = post.get('task_description') or f"AI-generated content for {platform}"
+                        
+                        # ✅ FIXED: Added missing fields
+                        campaign_plan[platform][week_num][day_key] = {
+                            "task": task_description,
+                            "human_feedback": "",  # ✅ Added missing field
+                            "regeneration_count": 0  # ✅ Added missing field
+                        }
+                    except Exception as e:
+                        campaign_plan[platform][week_num][day_key] = {
+                            "task": f"Error generating task: {str(e)}",
+                            "human_feedback": "",  # ✅ Added missing field
+                            "regeneration_count": 0  # ✅ Added missing field
+                        }
+                else:
+                    campaign_plan[platform][week_num][day_key] = {
+                        "task": f"No agent found for {platform}",
+                        "human_feedback": "",  # ✅ Added missing field
+                        "regeneration_count": 0  # ✅ Added missing field
+                    }
+   
+    return {
+        "messages": ["Campaign plan outline generated - awaiting approval"],
+        "current_step": "plan_generator",
+        "campaign_plan": campaign_plan,
+        "stage": "plan_generation"
+    }
+
 def content_validator(state: State) -> Dict[str, Any]:
-    """
-    Content validation agent that generates full content after approval using AI agents.
-    This runs in stage 2 to generate complete AI-powered campaign content.
-    """
-    base_plan = state.get("base_plan_dict", {})
-    platforms = state.get("platforms", ["instagram", "facebook", "x", "whatsapp", "email", "sms"])
-    campaign_theme = state.get("campaign_theme")
-   
-    # Create full content structure using AI agents
-    campaign_plan = {}
-   
-    for platform in platforms:
-        campaign_plan[platform] = {}
-       
-        for week_key, week_data in base_plan.items():
-            week_num = week_key.lower()
-            campaign_plan[platform][week_num] = {}
-           
-            for day_index, day_info in enumerate(week_data):
-                day_key = f"Day_{day_index + 1}"
-               
-                # Get the appropriate AI agent for the platform
-                agent_f = PLATFORM_AGENT_MAP.get(platform)
-                if agent_f:
-                    # Create a new state for the agent call
-                    agent_state = state.copy()
-                    agent_state["current_day"] = day_index + 1
-                    agent_state["total_days"] = len(week_data)
-                   
-                    try:
-                        # Call the AI agent to generate the content
-                        result = agent_f(agent_state)
-                        # Extract the AI-generated post from the result
-                        post = result.get(f"{platform}_post")
-                       
-                        # Extract the actual content from the post object
-                        if isinstance(post, dict):
-                            # Extract content and task description from the post
-                            content_text = post.get("content", "")
-                            task_description = post.get("task_description", f"AI-generated {platform} content for day {day_index + 1}")
-                        else:
-                            content_text = str(post) if post else ""
-                            task_description = f"AI-generated {platform} content for day {day_index + 1}"
-                       
-                        # Generate S3 image paths (simulated)
-                        image_paths = []
-                        if platform != "sms":  # SMS typically doesn't have images
-                            campaign_name = state.get("campaign_name", "campaign").replace("/", "_")
-                            image_paths = [f"s3://campaign-assets/{campaign_name}/{platform}/day_{day_index + 1}_image_{i+1}.jpg" for i in range(2)]
-                       
-                        campaign_plan[platform][week_num][day_key] = {
-                            "task": task_description,
-                            "content": content_text,  # AI-generated content as string
-                            "image_path_s3": image_paths,
-                            "human_feedback": ""
-                        }
-                    except Exception as e:
-                        # Fallback if AI generation fails
-                        campaign_plan[platform][week_num][day_key] = {
-                            "task": f"AI generation error for {platform}",
-                            "content": f"Error generating content: {str(e)}",
-                            "image_path_s3": [],
-                            "human_feedback": ""
-                        }
-                else:
-                    # Fallback if no agent is found
-                    campaign_plan[platform][week_num][day_key] = {
-                        "task": f"No AI agent found for {platform}",
-                        "content": f"Platform {platform} not supported",
-                        "image_path_s3": [],
-                        "human_feedback": ""
-                    }
-   
-    return {
-        "messages": [f"AI-powered content generated for '{campaign_theme or 'campaign'}' using AWS Bedrock"],
-        "current_step": "content_validator",
-        "campaign_plan": campaign_plan
-    }
- 
+    """
+    Content validation agent that generates full content after approval using AI agents.
+    This runs in stage 2 to generate complete AI-powered campaign content.
+    """
+    base_plan = state.get("base_plan_dict", {})
+    platforms = state.get("platforms", ["instagram", "facebook", "x", "whatsapp", "email", "sms"])
+    campaign_theme = state.get("campaign_theme")
+   
+    # ✅ FIXED: Create correct structure - each platform at root level
+    campaign_plan = {}
+   
+    for platform in platforms:
+        campaign_plan[platform] = {}  # Each platform at root level
+       
+        for week_key, week_data in base_plan.items():
+            week_num = week_key.lower()
+            campaign_plan[platform][week_num] = {}
+           
+            for day_index, day_info in enumerate(week_data):
+                day_key = f"Day_{day_index + 1}"
+               
+                # Get the appropriate AI agent for the platform
+                agent_f = PLATFORM_AGENT_MAP.get(platform)
+                if agent_f:
+                    # Create a new state for the agent call
+                    agent_state = state.copy()
+                    agent_state["current_day"] = day_index + 1
+                    agent_state["total_days"] = len(week_data)
+                   
+                    try:
+                        # Call the AI agent to generate the content
+                        result = agent_f(agent_state)
+                        # Extract the AI-generated post from the result
+                        post = result.get(f"{platform}_post")
+                       
+                        # Extract the actual content from the post object
+                        if isinstance(post, dict):
+                            content_text = post.get("content", "")
+                            task_description = post.get("task_description", f"AI-generated {platform} content for day {day_index + 1}")
+                        else:
+                            content_text = str(post) if post else ""
+                            task_description = f"AI-generated {platform} content for day {day_index + 1}"
+                       
+                        # Generate S3 image paths (simulated)
+                        image_paths = []
+                        if platform != "sms":  # SMS typically doesn't have images
+                            campaign_name = state.get("campaign_name", "campaign").replace("/", "_")
+                            image_paths = [f"s3://campaign-assets/{campaign_name}/{platform}/day_{day_index + 1}_image_{i+1}.jpg" for i in range(2)]
+                       
+                        # ✅ FIXED: Added missing fields
+                        campaign_plan[platform][week_num][day_key] = {
+                            "task": task_description,
+                            "content": content_text,
+                            "image_path_s3": image_paths,
+                            "human_feedback": "",  # ✅ Added missing field
+                            "regeneration_count": 0  # ✅ Added missing field
+                        }
+                    except Exception as e:
+                        # Fallback if AI generation fails
+                        campaign_plan[platform][week_num][day_key] = {
+                            "task": f"AI generation error for {platform}",
+                            "content": f"Error generating content: {str(e)}",
+                            "image_path_s3": [],
+                            "human_feedback": "",  # ✅ Added missing field
+                            "regeneration_count": 0  # ✅ Added missing field
+                        }
+                else:
+                    # Fallback if no agent is found
+                    campaign_plan[platform][week_num][day_key] = {
+                        "task": f"No AI agent found for {platform}",
+                        "content": f"Platform {platform} not supported",
+                        "image_path_s3": [],
+                        "human_feedback": "",  # ✅ Added missing field
+                        "regeneration_count": 0  # ✅ Added missing field
+                    }
+   
+    return {
+        "messages": [f"AI-powered content generated for '{campaign_theme or 'campaign'}' using AWS Bedrock"],
+        "current_step": "content_validator",
+        "campaign_plan": campaign_plan
+    }
+
 @tool
 def web_search_tool(query: str) -> str:
-    """
-    Web search tool for finding relevant information.
-   
-    Args:
-        query: The search query
-       
-    Returns:
-        Search results as a string
-    """
-    search = DuckDuckGoSearchRun()
-    return search.run(query)
+    """
+    Web search tool for finding relevant information.
+   
+    Args:
+        query: The search query
+       
+    Returns:
+        Search results as a string
+    """
+    search = DuckDuckGoSearchRun()
+    return search.run(query)
