@@ -175,10 +175,11 @@ system_agents = graph.compile()
 # src/api/feedback.py
 import json
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Tuple
 from pydantic import BaseModel
 from fastapi import APIRouter, HTTPException
-from botocore.exceptions import ClientError
+import inspect
+import logging
 
 from src.database.operations import (
     get_user_by_username,
@@ -187,6 +188,15 @@ from src.database.operations import (
 )
 from src.storage.s3 import s3_client, store_json_to_s3
 from src.agent.graph import system_agents
+# Import platform agents directly so feedback regen can call them and skip the graph/vector DB
+from src.agent.campaign_agent.social_media_agents import (
+    create_instagram_post,
+    create_facebook_post,
+    create_x_post,
+    create_whatsapp_post,
+    create_email_post,
+    create_sms_post
+)
 from utils.excel_generator import generate_and_upload_combined_excel_to_s3
 from utils.logger import logger
 from utils.env_vars import S3_BUCKET
@@ -214,6 +224,41 @@ def _default_post_result(post_id: str) -> Dict[str, Any]:
     }
 
 
+# map platform name -> function
+PLATFORM_AGENT_FN_MAP = {
+    "instagram": create_instagram_post,
+    "facebook": create_facebook_post,
+    "x": create_x_post,
+    "twitter": create_x_post,  # legacy alias
+    "whatsapp": create_whatsapp_post,
+    "email": create_email_post,
+    "sms": create_sms_post
+}
+
+
+def find_post_in_plan(campaign_plan: Dict[str, Any], post_id: str) -> Optional[Tuple[str, str, str]]:
+    """
+    Find the platform, week_key, day_key for a given post_id.
+    Expected post_id formats:
+        - "<platform>_<week_key>_<day_key>"  e.g. "sms_week_1_Day_1"
+        - or day_key itself, but prefer the above.
+    Returns tuple (platform, week_key, day_key) or None if not found.
+    """
+    if not campaign_plan:
+        return None
+    for platform, platform_data in campaign_plan.items():
+        if not isinstance(platform_data, dict):
+            continue
+        for week_key, week_data in platform_data.items():
+            if not isinstance(week_data, dict):
+                continue
+            for day_key in week_data.keys():
+                candidate = f"{platform}_{week_key}_{day_key}"
+                if candidate == post_id or day_key == post_id:
+                    return (platform, week_key, day_key)
+    return None
+
+
 @router.post("/{username}/{campaign_name}/feedback")
 async def submit_feedback(
     username: str,
@@ -224,7 +269,8 @@ async def submit_feedback(
     Batch feedback endpoint:
     - Accepts list of feedback items: [{post_id, feedback_text}, ...]
     - Regenerates only those posts
-    - Skips vector DB (Pinecone) during feedback runs
+    - Skips vector DB (Pinecone) during feedback runs by directly calling platform agents
+      when possible.
     - Produces versioned approved_plan_v{n}.json and versioned final excel
     - Persists feedback.json with approved_plan_versions history
     """
@@ -234,7 +280,7 @@ async def submit_feedback(
 
         # Validate user & campaign
         user_data = get_user_by_username(username)
-        if not user_
+        if not user_data:
             raise HTTPException(status_code=404, detail=f"User '{username}' not found")
 
         user_campaigns = get_user_campaigns(username)
@@ -309,29 +355,17 @@ async def submit_feedback(
             fb_text = fb.feedback_text or ""
             post_result = _default_post_result(post_id)
 
-            # Validate post exists inside campaign_plan
-            found = False
-            for platform, platform_data in (campaign_plan or {}).items():
-                if isinstance(platform_data, dict):
-                    for week_key, week_data in platform_data.items():
-                        if isinstance(week_data, dict):
-                            for day_key in week_data.keys():
-                                candidate = f"{platform}_{week_key}_{day_key}"
-                                if candidate == post_id or day_key == post_id:
-                                    found = True
-                                    break
-                            if found:
-                                break
-                    if found:
-                        break
-
-            if not found:
+            # Find the platform/week/day for this post
+            found_location = find_post_in_plan(campaign_plan, post_id)
+            if not found_location:
                 post_result.update({
                     "message": f"Post ID '{post_id}' not found in campaign plan.",
                     "success": False
                 })
                 aggregated_results["results"][post_id] = post_result
                 continue
+
+            platform, week_key, day_key = found_location
 
             # Regen attempt bookkeeping
             current_regen_attempts = feedback_dict.get("current_regen_attempts", {})
@@ -383,11 +417,78 @@ async def submit_feedback(
                 "is_regeneration": True
             }
 
-            # Invoke the compiled graph for this post only
+            # -------------------------
+            # DIRECT PLATFORM AGENT RUN
+            # -------------------------
+            final_state_dict: Dict[str, Any] = {}
             try:
-                final_state = await system_agents.ainvoke(state_input)
-                final_state_dict = dict(final_state)
-                logger.info(f"Regenerated content for {post_id}, version={version_number}")
+                agent_fn = PLATFORM_AGENT_FN_MAP.get(platform)
+                if agent_fn:
+                    logger.info(f"Calling platform agent directly for platform='{platform}', post_id='{post_id}' (skipping graph).")
+                    # sanitize state to reduce chance of vector DB usage inside agent
+                    sanitized_state = dict(state_input)
+                    sanitized_state["search_results"] = ""
+                    sanitized_state["optimized_prompts"] = {}
+                    sanitized_state["generated_images"] = []
+
+                    # call sync or async agent safely
+                    if inspect.iscoroutinefunction(agent_fn):
+                        result = await agent_fn(sanitized_state)
+                    else:
+                        result = agent_fn(sanitized_state)
+
+                    result = result or {}
+                    # Determine the key (e.g., 'sms_post', 'instagram_post', etc.)
+                    result_key = f"{platform}_post"
+                    post_obj = result.get(result_key, {}) if isinstance(result, dict) else {}
+
+                    # Extract generated fields
+                    generated_content = ""
+                    generated_task = ""
+                    if isinstance(post_obj, dict):
+                        generated_content = post_obj.get("content", "") or post_obj.get("body", "") or ""
+                        generated_task = post_obj.get("task_description", "") or post_obj.get("task", "") or ""
+
+                    # Update only the specific day entry in campaign_plan
+                    try:
+                        day_entry = campaign_plan.setdefault(platform, {}).setdefault(week_key, {}).setdefault(day_key, {})
+                        # Update fields carefully
+                        if generated_task:
+                            day_entry["task"] = generated_task
+                        if generated_content:
+                            day_entry["content"] = generated_content
+                        # ensure human feedback and regen count are recorded
+                        day_entry["human_feedback"] = fb_text
+                        day_entry["regeneration_count"] = day_entry.get("regeneration_count", 0) + 1
+                        day_entry["status"] = "Generated"
+                        # preserve image_path_s3 if present; agent may not return images
+                        if "image_path_s3" not in day_entry:
+                            day_entry["image_path_s3"] = day_entry.get("image_path_s3", [])
+                    except Exception as ex:
+                        logger.error(f"Failed to merge agent result into campaign_plan for {post_id}: {ex}")
+
+                    # Build final_state_dict to include updated campaign_plan and agent messages
+                    final_state_dict = {
+                        "campaign_plan": campaign_plan,
+                        "current_step": result.get("current_step", f"create_{platform}_post"),
+                        "messages": result.get("messages", [f"Regenerated {platform} post {post_id}"]),
+                        "generated_images": result.get("generated_images", []),
+                        "image_generation_status": result.get("image_generation_status", "skipped")
+                    }
+                    logger.info(f"Regenerated content for {post_id} via direct agent call, version={version_number}")
+                else:
+                    # fallback: call the compiled graph (this may trigger other nodes)
+                    logger.info(f"No direct platform agent found for '{platform}', falling back to graph invocation for {post_id}")
+                    # ensure we explicitly set keys to avoid vector lookups where possible
+                    state_input["search_results"] = ""
+                    state_input["optimized_prompts"] = {}
+                    final_state = await system_agents.ainvoke(state_input)
+                    final_state_dict = dict(final_state)
+                    # Merge returned campaign_plan if present
+                    if final_state_dict.get("campaign_plan"):
+                        campaign_plan = final_state_dict.get("campaign_plan")
+                    logger.info(f"Regenerated content for {post_id} via graph invocation, version={version_number}")
+
             except Exception as e:
                 logger.error(f"Error regenerating {post_id}: {e}")
                 post_result.update({
@@ -400,7 +501,8 @@ async def submit_feedback(
             # Build approved_plan_data for this version and attach human_feedback_map
             approved_plan_data = {
                 "campaign_name": campaign_full_name,
-                "campaign_plan": final_state_dict.get("campaign_plan", campaign_plan),
+                # use updated campaign_plan
+                "campaign_plan": campaign_plan,
                 "current_step": final_state_dict.get("current_step", "completed"),
                 "messages": final_state_dict.get("messages", []),
                 "stage": "content_generation",
@@ -415,7 +517,7 @@ async def submit_feedback(
                 "generated_images": final_state_dict.get("generated_images", []),
                 "image_generation_status": final_state_dict.get("image_generation_status", "skipped"),
                 "generated_at": datetime.utcnow().isoformat(),
-                # important: include the human feedback so excel generator can populate the column
+                # include the human feedback so excel generator can populate the column
                 "human_feedback_map": human_feedback_map.copy()
             }
 
@@ -455,7 +557,7 @@ async def submit_feedback(
             }
             feedback_dict.setdefault("approved_plan_versions", []).append(approved_history_entry)
 
-            # Update DB with feedback_response and regenration_count
+            # Update DB with feedback_response and regeneration_count
             try:
                 update_agentic_campaign_planner(
                     username=username,
@@ -495,9 +597,6 @@ async def submit_feedback(
     except Exception as e:
         logger.error(f"Unexpected error in submit_feedback: {e}")
         raise HTTPException(status_code=500, detail="Error processing feedback: Contact support team!")
-
-
-
 
 # src/agent/campaign_agent/social_media_agents.py
 from typing import Dict, Any
