@@ -203,328 +203,339 @@ class PostFeedback(BaseModel):
 class MultiFeedbackRequest(BaseModel):
     feedbacks: List[PostFeedback]
 
-def _default_post_result(post_id: str) -> Dict[str, Any]:
-    return {
-        "post_id": post_id,
-        "success": False,
-        "message": "Not processed",
-        "campaign_plan": {},
-        "regeneration_attempts": 0,
-        "version": None,
-        "excel_s3_url": ""
-    }
-
-def find_post_in_plan(campaign_plan: Dict[str, Any], post_id: str) -> Optional[Tuple[str, str, str]]:
-    if not campaign_plan:
-        return None
-    for platform, platform_data in campaign_plan.items():
-        if not isinstance(platform_data, dict):
-            continue
-        for week_key, week_data in platform_data.items():
-            if not isinstance(week_data, dict):
-                continue
-            for day_key in week_data.keys():
-                candidate = f"{platform}_{week_key}_{day_key}"
-                if candidate == post_id or day_key == post_id:
-                    return (platform, week_key, day_key)
-    return None
-
 @router.post("/{username}/{campaign_name}/feedback")
 async def submit_feedback(
-    username: str,
-    campaign_name: str,
-    feedback_request: MultiFeedbackRequest
+    username: str,
+    campaign_name: str,
+    feedback_request: MultiFeedbackRequest
 ) -> Dict[str, Any]:
-    try:
-        campaign_full_name = f"{username}/{campaign_name}"
-        logger.info(f"Processing multi-feedback for {campaign_full_name}")
+    """
+    Batch feedback endpoint:
+    - Accepts list of feedback items: [{post_id, feedback_text}, ...]
+    - Regenerates only those posts
+    - Skips vector DB (Pinecone) during feedback runs
+    - Produces versioned approved_plan_v{n}.json and versioned final excel
+    - Persists feedback.json with approved_plan_versions history
+    """
+    try:
+        campaign_full_name = f"{username}/{campaign_name}"
+        logger.info(f"Processing multi-feedback for {campaign_full_name}")
+ 
+        # Validate user & campaign
+        user_data = get_user_by_username(username)
+        if not user_data:
+            raise HTTPException(status_code=404, detail=f"User '{username}' not found")
+ 
+        user_campaigns = get_user_campaigns(username)
+        if not user_campaigns:
+            raise HTTPException(status_code=404, detail=f"No campaigns found for user '{username}'")
+ 
+        campaign_match = next((c for c in user_campaigns if c['campaign_name'].lower() == campaign_name.lower()), None)
+        if not campaign_match:
+            raise HTTPException(status_code=404, detail=f"Campaign '{campaign_name}' not found for user '{username}'")
+ 
+        # Load approved_plan (preferred) or fallback to plan.json
+        campaign_plan = None
+        try:
+            plan_obj = s3_client.get_object(
+                Bucket=S3_BUCKET,
+                Key=f"campaigns/{username}/{campaign_name}/campaign_planner/response/approved_plan.json"
+            )
+            campaign_plan = json.loads(plan_obj["Body"].read().decode("utf-8")).get("campaign_plan")
+            logger.info(f"Loaded approved_plan.json for {campaign_full_name}")
+        except s3_client.exceptions.NoSuchKey:
+            try:
+                plan_obj = s3_client.get_object(
+                    Bucket=S3_BUCKET,
+                    Key=f"campaigns/{username}/{campaign_name}/campaign_planner/response/plan.json"
+                )
+                campaign_plan = json.loads(plan_obj["Body"].read().decode("utf-8")).get("campaign_plan")
+                logger.info(f"Loaded plan.json for {campaign_full_name}")
+            except s3_client.exceptions.NoSuchKey:
+                raise HTTPException(status_code=404, detail=f"Campaign plan not found for '{campaign_full_name}'")
+ 
+        if not campaign_plan:
+            raise HTTPException(status_code=404, detail=f"Campaign plan not found for '{campaign_full_name}'")
+ 
+        # Load or initialize feedback.json
+        try:
+            fb_obj = s3_client.get_object(
+                Bucket=S3_BUCKET,
+                Key=f"campaigns/{username}/{campaign_name}/campaign_planner/response/feedback.json"
+            )
+            feedback_dict = json.loads(fb_obj["Body"].read().decode("utf-8"))
+        except s3_client.exceptions.NoSuchKey:
+            feedback_dict = {
+                "campaign_name": campaign_full_name,
+                "feedback_history": [],
+                "current_regen_attempts": {},
+                "max_regen_attempts": 3,
+                "approved_plan_versions": []
+            }
+ 
+        # Load plan state metadata if exists
+        try:
+            state_obj = s3_client.get_object(
+                Bucket=S3_BUCKET,
+                Key=f"campaigns/{username}/{campaign_name}/campaign_planner/response/plan.json"
+            )
+            state_dict = json.loads(state_obj["Body"].read().decode("utf-8"))
+        except s3_client.exceptions.NoSuchKey:
+            state_dict = {
+                "campaign_name": campaign_full_name,
+                "campaign_plan": campaign_plan,
+                "current_regen_attempts": feedback_dict.get("current_regen_attempts", {}),
+                "max_regen_attempts": feedback_dict.get("max_regen_attempts", 3),
+                "is_regen_required": True
+            }
+ 
+        aggregated_results: Dict[str, Any] = {"campaign_name": campaign_full_name, "results": {}}
+        human_feedback_map: Dict[str, str] = {}  # collects feedback per post to pass into plan_data -> excel
+ 
+        # Sequentially process each feedback to avoid race conditions on S3/DB writes
+        for fb in feedback_request.feedbacks:
+            post_id = fb.post_id
+            fb_text = fb.feedback_text or ""
+            post_result = _default_post_result(post_id)
+ 
+            # Validate post exists inside campaign_plan
+            found = False
+            for platform, platform_data in (campaign_plan or {}).items():
+                if isinstance(platform_data, dict):
+                    for week_key, week_data in platform_data.items():
+                        if isinstance(week_data, dict):
+                            for day_key in week_data.keys():
+                                candidate = f"{platform}_{week_key}_{day_key}"
+                                if candidate == post_id or day_key == post_id:
+                                    found = True
+                                    break
+                            if found:
+                                break
+                    if found:
+                        break
+ 
+            if not found:
+                post_result.update({
+                    "message": f"Post ID '{post_id}' not found in campaign plan.",
+                    "success": False
+                })
+                aggregated_results["results"][post_id] = post_result
+                continue
+ 
+            # Regen attempt bookkeeping
+            current_regen_attempts = feedback_dict.get("current_regen_attempts", {})
+            current_attempts = current_regen_attempts.get(post_id, 0)
+            max_regen_attempts = feedback_dict.get("max_regen_attempts", 3)
+ 
+            if current_attempts >= max_regen_attempts:
+                history_entry = {
+                    "post_id": post_id,
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "feedback_text": fb_text,
+                    "regen_attempt_number": current_attempts + 1,
+                    "note": "Max attempts reached"
+                }
+                feedback_dict.setdefault("feedback_history", []).append(history_entry)
+                post_result.update({
+                    "message": f"Maximum regeneration attempts ({max_regen_attempts}) reached for '{post_id}'",
+                    "success": False,
+                    "regeneration_attempts": current_attempts
+                })
+                aggregated_results["results"][post_id] = post_result
+                continue
+ 
+            # Append feedback history & increment attempts
+            feedback_entry = {
+                "post_id": post_id,
+                "timestamp": datetime.utcnow().isoformat(),
+                "feedback_text": fb_text,
+                "regen_attempt_number": current_attempts + 1
+            }
+            feedback_dict.setdefault("feedback_history", []).append(feedback_entry)
+            current_regen_attempts[post_id] = current_attempts + 1
+            feedback_dict["current_regen_attempts"] = current_regen_attempts
+ 
+            # Map feedback for excel insertion
+            human_feedback_map[post_id] = fb_text
+ 
+            # Build state input for agents for this single-post regeneration
+            version_number = current_regen_attempts.get(post_id, 1)
+            state_input = {
+                **state_dict,
+                **feedback_dict,
+                "stage": "content_generation",
+                "plan_approved": True,
+                "base_plan_dict": campaign_plan,
+                "current_post_id": post_id,
+                "regen_attempt_number": version_number,
+                "human_feedback_text": fb_text,
+                "is_regeneration": True
+            }
+ 
+            # Invoke the compiled graph for this post only
+            try:
+                final_state = await system_agents.ainvoke(state_input)
+                final_state_dict = dict(final_state)
+                logger.info(f"Regenerated content for {post_id}, version={version_number}")
+            except Exception as e:
+                logger.error(f"Error regenerating {post_id}: {e}")
+                post_result.update({
+                    "message": f"Error during regeneration: {str(e)}",
+                    "success": False
+                })
+                aggregated_results["results"][post_id] = post_result
+                continue
+ 
+            # Build approved_plan_data for this version and attach human_feedback_map
+            approved_plan_data = {
+                "campaign_name": campaign_full_name,
+                "campaign_plan": final_state_dict.get("campaign_plan", campaign_plan),
+                "current_step": final_state_dict.get("current_step", "completed"),
+                "messages": final_state_dict.get("messages", []),
+                "stage": "content_generation",
+                "plan_approved": True,
+                "campaign_objective": state_dict.get("campaign_objective", ""),
+                "campaign_description": state_dict.get("campaign_description", ""),
+                "start_date": state_dict.get("start_date", ""),
+                "end_date": state_dict.get("end_date", ""),
+                "target_audience": state_dict.get("target_audience", ""),
+                "target_audience_info": state_dict.get("target_audience_info", []),
+                "platforms": state_dict.get("platforms", []),
+                "generated_images": final_state_dict.get("generated_images", []),
+                "image_generation_status": final_state_dict.get("image_generation_status", "skipped"),
+                "generated_at": datetime.utcnow().isoformat(),
+                # important: include the human feedback so excel generator can populate the column
+                "human_feedback_map": human_feedback_map.copy()
+            }
+ 
+            # Persist versioned approved_plan and latest
+            versioned_key = f"campaigns/{username}/{campaign_name}/campaign_planner/response/approved_plan_v{version_number}.json"
+            latest_key = f"campaigns/{username}/{campaign_name}/campaign_planner/response/approved_plan.json"
+            try:
+                store_json_to_s3(bucket=S3_BUCKET, key=versioned_key, data=approved_plan_data)
+                store_json_to_s3(bucket=S3_BUCKET, key=latest_key, data=approved_plan_data)
+            except Exception as e:
+                logger.error(f"Failed storing approved_plan for {post_id}: {e}")
+ 
+            # Generate & upload versioned final excel (pass plan_data so excel picks up human_feedback_map)
+            excel_s3_url = ""
+            try:
+                excel_s3_url = generate_and_upload_combined_excel_to_s3(
+                    campaign_plan=approved_plan_data["campaign_plan"],
+                    campaign_name=campaign_full_name,
+                    bucket=S3_BUCKET,
+                    plan_data=approved_plan_data,
+                    version=version_number
+                )
+                # write excel url back into plan and persist again
+                approved_plan_data["excel_s3_url"] = excel_s3_url
+                store_json_to_s3(bucket=S3_BUCKET, key=versioned_key, data=approved_plan_data)
+                store_json_to_s3(bucket=S3_BUCKET, key=latest_key, data=approved_plan_data)
+            except Exception as e:
+                logger.error(f"Failed generate/upload excel for {post_id} v{version_number}: {e}")
+ 
+            # Append to feedback_dict approved_plan_versions history
+            approved_history_entry = {
+                "version": version_number,
+                "approved_plan_key": versioned_key,
+                "excel_s3_url": excel_s3_url,
+                "post_id": post_id,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            feedback_dict.setdefault("approved_plan_versions", []).append(approved_history_entry)
+ 
+            # Update DB with feedback_response and regenration_count
+            try:
+                update_agentic_campaign_planner(
+                    username=username,
+                    campaign_name=campaign_name,
+                    feedback_response=json.dumps({
+                        "feedback": feedback_dict,
+                        "final_state": final_state_dict
+                    }, ensure_ascii=False),
+                    regenration_count=sum(feedback_dict.get("current_regen_attempts", {}).values())
+                )
+            except Exception as e:
+                logger.error(f"Failed DB update for {campaign_full_name}: {e}")
+ 
+            # Build post_result to return
+            final_regen_attempts = feedback_dict.get("current_regen_attempts", {}).get(post_id, 0)
+            post_result.update({
+                "success": True,
+                "message": "Feedback processed and post regenerated",
+                "campaign_plan": approved_plan_data.get("campaign_plan", {}),
+                "regeneration_attempts": final_regen_attempts,
+                "version": version_number,
+                "excel_s3_url": excel_s3_url
+            })
+            aggregated_results["results"][post_id] = post_result
+ 
+        # After processing all feedbacks, persist feedback.json
+        try:
+            store_json_to_s3(bucket=S3_BUCKET, key=f"campaigns/{username}/{campaign_name}/campaign_planner/response/feedback.json", data=feedback_dict)
+            logger.info(f"Persisted feedback.json for {campaign_full_name}")
+        except Exception as e:
+            logger.error(f"Failed to persist feedback.json: {e}")
+ 
+        return aggregated_results
+ 
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error in submit_feedback: {e}")
+        raise HTTPException(status_code=500, detail="Error processing feedback: Contact support team!")
+ 
+@router.get("/{username}/{campaign_name}", response_class=StreamingResponse)
+async def download_campaign_file(
+    username: str,
+    campaign_name: str,
+    file_type: str = "plan",
+    version: int = None   # optional version param (e.g., ?version=2)
+    ):
+    """
+    Download versioned campaign Excel. If version provided, tries:
+        campaigns/{username}/{campaign_name}/campaign_planner/excel/<username>_<campaign>_final_v{version}.xlsx
+    Otherwise returns latest (non-versioned) plan or final file if exists.
+    """
+    try:
+        # build expected file names
+        base_clean = f"{username}_{campaign_name}"
+        if file_type == "plan":
+            # plan file naming: <username>_<campaign>_plan.xlsx (non-versioned)
+            if version:
+                excel_filename = f"{base_clean}_plan_v{version}.xlsx"
+            else:
+                excel_filename = f"{base_clean}_plan.xlsx"
+            s3_key = f"campaigns/{username}/{campaign_name}/campaign_planner/excel/{excel_filename}"
+        elif file_type == "campaign":
+            # final file naming: <username>_<campaign>_final_v{version}.xlsx or non-versioned final
+            if version:
+                excel_filename = f"{base_clean}_final_v{version}.xlsx"
+            else:
+                excel_filename = f"{base_clean}_final.xlsx"
+            s3_key = f"campaigns/{username}/{campaign_name}/campaign_planner/excel/{excel_filename}"
+        else:
+            raise HTTPException(status_code=400, detail="Invalid file_type. Must be 'plan' or 'campaign'.")
+        try:
+            s3_object = s3_client.get_object(Bucket=S3_BUCKET, Key=s3_key)
+            file_content = s3_object["Body"].read()
+            response = StreamingResponse(
+                io.BytesIO(file_content),
+                media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+            response.headers["Content-Disposition"] = f"attachment; filename={excel_filename}"
+            return response
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            if code in ("NoSuchKey", "404"):
+                raise HTTPException(status_code=404, detail=f"{file_type.capitalize()} file not found (version={version}).")
+            raise HTTPException(status_code=500, detail="Error retrieving file from S3.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
-        # Validate user & campaign
-        user_data = get_user_by_username(username)
-        if not user_data:
-            raise HTTPException(status_code=404, detail=f"User '{username}' not found")
-
-        user_campaigns = get_user_campaigns(username)
-        if not user_campaigns:
-            raise HTTPException(status_code=404, detail=f"No campaigns found for user '{username}'")
-
-        campaign_match = next((c for c in user_campaigns if c['campaign_name'].lower() == campaign_name.lower()), None)
-        if not campaign_match:
-            raise HTTPException(status_code=404, detail=f"Campaign '{campaign_name}' not found for user '{username}'")
-
-        # Load approved_plan or fallback plan.json
-        campaign_plan = None
-        try:
-            plan_obj = s3_client.get_object(
-                Bucket=S3_BUCKET,
-                Key=f"campaigns/{username}/{campaign_name}/campaign_planner/response/approved_plan.json"
-            )
-            campaign_plan = json.loads(plan_obj["Body"].read().decode("utf-8")).get("campaign_plan")
-            logger.info(f"Loaded approved_plan.json for {campaign_full_name}")
-        except s3_client.exceptions.NoSuchKey:
-            try:
-                plan_obj = s3_client.get_object(
-                    Bucket=S3_BUCKET,
-                    Key=f"campaigns/{username}/{campaign_name}/campaign_planner/response/plan.json"
-                )
-                campaign_plan = json.loads(plan_obj["Body"].read().decode("utf-8")).get("campaign_plan")
-                logger.info(f"Loaded plan.json for {campaign_full_name}")
-            except s3_client.exceptions.NoSuchKey:
-                raise HTTPException(status_code=404, detail=f"Campaign plan not found for '{campaign_full_name}'")
-
-        if not campaign_plan:
-            raise HTTPException(status_code=404, detail=f"Campaign plan not found for '{campaign_full_name}'")
-
-        # Load or init feedback.json
-        try:
-            fb_obj = s3_client.get_object(
-                Bucket=S3_BUCKET,
-                Key=f"campaigns/{username}/{campaign_name}/campaign_planner/response/feedback.json"
-            )
-            feedback_dict = json.loads(fb_obj["Body"].read().decode("utf-8"))
-        except s3_client.exceptions.NoSuchKey:
-            feedback_dict = {
-                "campaign_name": campaign_full_name,
-                "feedback_history": [],
-                "current_regen_attempts": {},
-                "max_regen_attempts": 3,
-                "approved_plan_versions": []
-            }
-
-        # Load plan state metadata if exists
-        try:
-            state_obj = s3_client.get_object(
-                Bucket=S3_BUCKET,
-                Key=f"campaigns/{username}/{campaign_name}/campaign_planner/response/plan.json"
-            )
-            state_dict = json.loads(state_obj["Body"].read().decode("utf-8"))
-        except s3_client.exceptions.NoSuchKey:
-            state_dict = {
-                "campaign_name": campaign_full_name,
-                "campaign_plan": campaign_plan,
-                "current_regen_attempts": feedback_dict.get("current_regen_attempts", {}),
-                "max_regen_attempts": feedback_dict.get("max_regen_attempts", 3),
-                "is_regen_required": True
-            }
-
-        aggregated_results: Dict[str, Any] = {"campaign_name": campaign_full_name, "results": {}}
-        human_feedback_map: Dict[str, str] = {}
-
-        for fb in feedback_request.feedbacks:
-            post_id = fb.post_id
-            fb_text = fb.feedback_text or ""
-            post_result = _default_post_result(post_id)
-
-            found_location = find_post_in_plan(campaign_plan, post_id)
-            if not found_location:
-                post_result.update({
-                    "message": f"Post ID '{post_id}' not found in campaign plan.",
-                    "success": False
-                })
-                aggregated_results["results"][post_id] = post_result
-                continue
-
-            platform, week_key, day_key = found_location
-            current_regen_attempts = feedback_dict.get("current_regen_attempts", {})
-            current_attempts = current_regen_attempts.get(post_id, 0)
-            max_regen_attempts = feedback_dict.get("max_regen_attempts", 3)
-
-            if current_attempts >= max_regen_attempts:
-                feedback_dict.setdefault("feedback_history", []).append({
-                    "post_id": post_id,
-                    "timestamp": datetime.utcnow().isoformat(),
-                    "feedback_text": fb_text,
-                    "regen_attempt_number": current_attempts + 1,
-                    "note": "Max attempts reached"
-                })
-                post_result.update({
-                    "message": f"Maximum regeneration attempts ({max_regen_attempts}) reached for '{post_id}'",
-                    "success": False,
-                    "regeneration_attempts": current_attempts
-                })
-                aggregated_results["results"][post_id] = post_result
-                continue
-
-            feedback_dict.setdefault("feedback_history", []).append({
-                "post_id": post_id,
-                "timestamp": datetime.utcnow().isoformat(),
-                "feedback_text": fb_text,
-                "regen_attempt_number": current_attempts + 1
-            })
-            current_regen_attempts[post_id] = current_attempts + 1
-            feedback_dict["current_regen_attempts"] = current_regen_attempts
-            human_feedback_map[post_id] = fb_text
-
-            version_number = current_regen_attempts.get(post_id, 1)
-            state_input = {
-                **state_dict,
-                **feedback_dict,
-                "stage": "content_generation",
-                "plan_approved": True,
-                "base_plan_dict": campaign_plan,
-                "current_post_id": post_id,
-                "regen_attempt_number": version_number,
-                "human_feedback_text": fb_text,
-                "is_regeneration": True
-            }
-
-            final_state_dict: Dict[str, Any] = {}
-            try:
-                agent_fn = PLATFORM_AGENT_MAP.get(platform)
-                if agent_fn:
-                    logger.info(f"Calling platform agent directly for platform='{platform}', post_id='{post_id}' (skipping graph).")
-                    sanitized_state = dict(state_input)
-                    sanitized_state["search_results"] = ""
-                    sanitized_state["optimized_prompts"] = {}
-                    sanitized_state["generated_images"] = []
-
-                    if inspect.iscoroutinefunction(agent_fn):
-                        result = await agent_fn(sanitized_state)
-                    else:
-                        result = agent_fn(sanitized_state)
-
-                    result = result or {}
-                    result_key = f"{platform}_post"
-                    post_obj = result.get(result_key, {}) if isinstance(result, dict) else {}
-
-                    generated_content = ""
-                    generated_task = ""
-                    if isinstance(post_obj, dict):
-                        generated_content = post_obj.get("content", "") or post_obj.get("body", "") or ""
-                        generated_task = post_obj.get("task_description", "") or post_obj.get("task", "") or ""
-
-                    try:
-                        day_entry = campaign_plan.setdefault(platform, {}).setdefault(week_key, {}).setdefault(day_key, {})
-                        if generated_task:
-                            day_entry["task"] = generated_task
-                        if generated_content:
-                            day_entry["content"] = generated_content
-                        day_entry["human_feedback"] = fb_text
-                        day_entry["regeneration_count"] = day_entry.get("regeneration_count", 0) + 1
-                        day_entry["status"] = "Generated"
-                        if "image_path_s3" not in day_entry:
-                            day_entry["image_path_s3"] = day_entry.get("image_path_s3", [])
-                    except Exception as ex:
-                        logger.error(f"Failed to merge agent result into campaign_plan for {post_id}: {ex}")
-
-                    final_state_dict = {
-                        "campaign_plan": campaign_plan,
-                        "current_step": result.get("current_step", f"create_{platform}_post"),
-                        "messages": result.get("messages", [f"Regenerated {platform} post {post_id}"]),
-                        "generated_images": result.get("generated_images", []),
-                        "image_generation_status": result.get("image_generation_status", "skipped")
-                    }
-                    logger.info(f"Regenerated content for {post_id} via direct agent call, version={version_number}")
-                else:
-                    logger.info(f"No direct platform agent found for '{platform}', falling back to graph invocation for {post_id}")
-                    state_input["search_results"] = ""
-                    state_input["optimized_prompts"] = {}
-                    final_state = await system_agents.ainvoke(state_input)
-                    final_state_dict = dict(final_state)
-                    if final_state_dict.get("campaign_plan"):
-                        campaign_plan = final_state_dict.get("campaign_plan")
-                    logger.info(f"Regenerated content for {post_id} via graph invocation, version={version_number}")
-
-            except Exception as e:
-                logger.error(f"Error regenerating {post_id}: {e}")
-                post_result.update({
-                    "message": f"Error during regeneration: {str(e)}",
-                    "success": False
-                })
-                aggregated_results["results"][post_id] = post_result
-                continue
-
-            approved_plan_data = {
-                "campaign_name": campaign_full_name,
-                "campaign_plan": campaign_plan,
-                "current_step": final_state_dict.get("current_step", "completed"),
-                "messages": final_state_dict.get("messages", []),
-                "stage": "content_generation",
-                "plan_approved": True,
-                "campaign_objective": state_dict.get("campaign_objective", ""),
-                "campaign_description": state_dict.get("campaign_description", ""),
-                "start_date": state_dict.get("start_date", ""),
-                "end_date": state_dict.get("end_date", ""),
-                "target_audience": state_dict.get("target_audience", ""),
-                "target_audience_info": state_dict.get("target_audience_info", []),
-                "platforms": state_dict.get("platforms", []),
-                "generated_images": final_state_dict.get("generated_images", []),
-                "image_generation_status": final_state_dict.get("image_generation_status", "skipped"),
-                "generated_at": datetime.utcnow().isoformat(),
-                "human_feedback_map": human_feedback_map.copy()
-            }
-
-            versioned_key = f"campaigns/{username}/{campaign_name}/campaign_planner/response/approved_plan_v{version_number}.json"
-            latest_key = f"campaigns/{username}/{campaign_name}/campaign_planner/response/approved_plan.json"
-
-            try:
-                store_json_to_s3(bucket=S3_BUCKET, key=versioned_key, data=approved_plan_data)
-                store_json_to_s3(bucket=S3_BUCKET, key=latest_key, data=approved_plan_data)
-            except Exception as e:
-                logger.error(f"Failed storing approved_plan for {post_id}: {e}")
-
-            excel_s3_url = ""
-            try:
-                excel_s3_url = generate_and_upload_combined_excel_to_s3(
-                    campaign_plan=approved_plan_data["campaign_plan"],
-                    campaign_name=campaign_full_name,
-                    bucket=S3_BUCKET,
-                    plan_data=approved_plan_data,
-                    version=version_number
-                )
-                approved_plan_data["excel_s3_url"] = excel_s3_url
-                store_json_to_s3(bucket=S3_BUCKET, key=versioned_key, data=approved_plan_data)
-                store_json_to_s3(bucket=S3_BUCKET, key=latest_key, data=approved_plan_data)
-            except Exception as e:
-                logger.error(f"Failed generate/upload excel for {post_id} v{version_number}: {e}")
-
-            approved_history_entry = {
-                "version": version_number,
-                "approved_plan_key": versioned_key,
-                "excel_s3_url": excel_s3_url,
-                "post_id": post_id,
-                "timestamp": datetime.utcnow().isoformat()
-            }
-            feedback_dict.setdefault("approved_plan_versions", []).append(approved_history_entry)
-
-            try:
-                update_agentic_campaign_planner(
-                    username=username,
-                    campaign_name=campaign_name,
-                    feedback_response=json.dumps({
-                        "feedback": feedback_dict,
-                        "final_state": final_state_dict
-                    }, ensure_ascii=False),
-                    regenration_count=sum(feedback_dict.get("current_regen_attempts", {}).values())
-                )
-            except Exception as e:
-                logger.error(f"Failed DB update for {campaign_full_name}: {e}")
-
-            final_regen_attempts = feedback_dict.get("current_regen_attempts", {}).get(post_id, 0)
-            post_result.update({
-                "success": True,
-                "message": "Feedback processed and post regenerated",
-                "campaign_plan": approved_plan_data.get("campaign_plan", {}),
-                "regeneration_attempts": final_regen_attempts,
-                "version": version_number,
-                "excel_s3_url": excel_s3_url
-            })
-            aggregated_results["results"][post_id] = post_result
-
-        try:
-            store_json_to_s3(bucket=S3_BUCKET, key=f"campaigns/{username}/{campaign_name}/campaign_planner/response/feedback.json", data=feedback_dict)
-            logger.info(f"Persisted feedback.json for {campaign_full_name}")
-        except Exception as e:
-            logger.error(f"Failed to persist feedback.json: {e}")
-
-        return aggregated_results
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected error in submit_feedback: {e}")
-        raise HTTPException(status_code=500, detail="Error processing feedback: Contact support team!")
-
+        
 # src/agent/campaign_agent/social_media_agents.py
 from typing import Dict, Any
 from src.models import State
