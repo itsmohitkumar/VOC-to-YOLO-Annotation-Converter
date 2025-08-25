@@ -1433,6 +1433,7 @@ def generate_and_upload_combined_excel_to_s3(
     s3_url = upload_excel_to_s3(excel_content, s3_key, bucket)
     return s3_url
     
+###system_agents.py:
           
 from typing import Dict, Any
 from langchain_core.tools import tool
@@ -1654,14 +1655,15 @@ def plan_generator(state: State) -> Dict[str, Any]:
     base_plan = state.get("base_plan_dict", {})
     platforms = state.get("platforms", ["instagram", "facebook", "x", "whatsapp", "email", "sms"])
    
-    # ✅ FIXED: Create correct structure - each platform at root level
+    # ✅ FIXED: Create correct structure - platform -> week -> day
     campaign_plan = {}
     
     for platform in platforms:
         campaign_plan[platform] = {}  # Each platform at root level
         
         for week_key, week_data in base_plan.items():
-            week_num = week_key.lower()
+            # ✅ FIX: Use proper week naming (week_1, week_2, etc.)
+            week_num = f"week_{week_key.split('_')[-1]}" if '_' in week_key else f"week_1"
             campaign_plan[platform][week_num] = {}
             
             for day_index, day_info in enumerate(week_data):
@@ -1675,25 +1677,24 @@ def plan_generator(state: State) -> Dict[str, Any]:
                     try:
                         result = agent_f(agent_state)
                         post = result.get(f"{platform}_post")
-                        task_description = post.get('task_description') or f"AI-generated content for {platform}"
+                        task_description = post.get('task_description') if post else f"AI-generated content for {platform}"
                         
-                        # ✅ FIXED: Added missing fields
                         campaign_plan[platform][week_num][day_key] = {
                             "task": task_description,
-                            "human_feedback": "",  # ✅ Added missing field
-                            "regeneration_count": 0  # ✅ Added missing field
+                            "human_feedback": "",
+                            "regeneration_count": 0
                         }
                     except Exception as e:
                         campaign_plan[platform][week_num][day_key] = {
                             "task": f"Error generating task: {str(e)}",
-                            "human_feedback": "",  # ✅ Added missing field
-                            "regeneration_count": 0  # ✅ Added missing field
+                            "human_feedback": "",
+                            "regeneration_count": 0
                         }
                 else:
                     campaign_plan[platform][week_num][day_key] = {
                         "task": f"No agent found for {platform}",
-                        "human_feedback": "",  # ✅ Added missing field
-                        "regeneration_count": 0  # ✅ Added missing field
+                        "human_feedback": "",
+                        "regeneration_count": 0
                     }
    
     return {
@@ -1712,14 +1713,15 @@ def content_validator(state: State) -> Dict[str, Any]:
     platforms = state.get("platforms", ["instagram", "facebook", "x", "whatsapp", "email", "sms"])
     campaign_theme = state.get("campaign_theme")
    
-    # ✅ FIXED: Create correct structure - each platform at root level
+    # ✅ FIXED: Create correct structure - platform -> week -> day
     campaign_plan = {}
    
     for platform in platforms:
         campaign_plan[platform] = {}  # Each platform at root level
        
         for week_key, week_data in base_plan.items():
-            week_num = week_key.lower()
+            # ✅ FIX: Use proper week naming (week_1, week_2, etc.)
+            week_num = f"week_{week_key.split('_')[-1]}" if '_' in week_key else f"week_1"
             campaign_plan[platform][week_num] = {}
            
             for day_index, day_info in enumerate(week_data):
@@ -1753,13 +1755,12 @@ def content_validator(state: State) -> Dict[str, Any]:
                             campaign_name = state.get("campaign_name", "campaign").replace("/", "_")
                             image_paths = [f"s3://campaign-assets/{campaign_name}/{platform}/day_{day_index + 1}_image_{i+1}.jpg" for i in range(2)]
                        
-                        # ✅ FIXED: Added missing fields
                         campaign_plan[platform][week_num][day_key] = {
                             "task": task_description,
                             "content": content_text,
                             "image_path_s3": image_paths,
-                            "human_feedback": "",  # ✅ Added missing field
-                            "regeneration_count": 0  # ✅ Added missing field
+                            "human_feedback": "",
+                            "regeneration_count": 0
                         }
                     except Exception as e:
                         # Fallback if AI generation fails
@@ -1767,8 +1768,8 @@ def content_validator(state: State) -> Dict[str, Any]:
                             "task": f"AI generation error for {platform}",
                             "content": f"Error generating content: {str(e)}",
                             "image_path_s3": [],
-                            "human_feedback": "",  # ✅ Added missing field
-                            "regeneration_count": 0  # ✅ Added missing field
+                            "human_feedback": "",
+                            "regeneration_count": 0
                         }
                 else:
                     # Fallback if no agent is found
@@ -1776,8 +1777,8 @@ def content_validator(state: State) -> Dict[str, Any]:
                         "task": f"No AI agent found for {platform}",
                         "content": f"Platform {platform} not supported",
                         "image_path_s3": [],
-                        "human_feedback": "",  # ✅ Added missing field
-                        "regeneration_count": 0  # ✅ Added missing field
+                        "human_feedback": "",
+                        "regeneration_count": 0
                     }
    
     return {
