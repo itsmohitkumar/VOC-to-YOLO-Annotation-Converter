@@ -114,7 +114,8 @@ async def create_campaign_plan(
                 f"campaign planning {target_audience}"
             ]
             collection_name = campaign_full_name
-            collection_info = get_collection_info(collection_name, user_id=user_data.get('user_id'))... if collection_info.get('success') and collection_info.get('metadata', {}).get('count', 0) > 0:
+            collection_info = get_collection_info(collection_name, user_id=user_data.get('user_id'))
+            if collection_info.get('success') and collection_info.get('metadata', {}).get('count', 0) > 0:
                 logger.info(f"Found vector database collection for user: {collection_name}")
                 for query in search_queries:
                     search_results = hybrid_search(
@@ -202,7 +203,9 @@ async def create_campaign_plan(
             logger.info(f"Content review completed. Status: {content_review_status}")
         except Exception as e:
             logger.error(f"Error in content review process: {e}")
-            content_review_status = "error"... # Upload Excel to S3
+            content_review_status = "error"
+
+        # Upload Excel to S3
         try:
             bucket_name = S3_BUCKET
             excel_content = generate_campaign_excel(campaign_plan, campaign_full_name, stage="plan")
@@ -235,6 +238,12 @@ async def create_campaign_plan(
             "content_review_status": content_review_status,
             "excel_s3_url": excel_s3_url
         }
+
+        store_json_to_s3(
+            bucket=S3_BUCKET,
+            key=f"campaigns/{username}/{campaign_name}/campaign_planner/response/plan.json",
+            data=plan_data
+        )
 
         insert_agentic_campaign_planner(
             username=username,
@@ -315,7 +324,9 @@ async def approve_campaign_plan(
             raise HTTPException(status_code=404, detail=f"Campaign plan not found for '{campaign_full_name}'.")
         except Exception as e:
             logger.error(f"Error reading plan.json for '{campaign_full_name}': {e}")
-            raise HTTPException(status_code=500, detail="Failed to read stored campaign plan")... # Validate essential fields from stored plan
+            raise HTTPException(status_code=500, detail="Failed to read stored campaign plan")
+
+        # Validate essential fields from stored plan
         required_fields = [
             "campaign_name", "campaign_objective", "campaign_description",
             "start_date", "end_date", "target_audience", "target_audience_info",
@@ -398,7 +409,9 @@ async def approve_campaign_plan(
             except json.JSONDecodeError:
                 logger.warning("campaign_plan returned from agent is not valid JSON; returning as-is")
         elif hasattr(campaign_plan, "dict") and callable(getattr(campaign_plan, "dict")):
-            campaign_plan = campaign_plan.dict()... # ========================= Image sanitization (minimal since no images) =========================
+            campaign_plan = campaign_plan.dict()
+
+        # ========================= Image sanitization (minimal since no images) =========================
         def _sanitize_image_fields(obj: Any) -> Any:
             if isinstance(obj, dict):
                 clean = {}
@@ -456,6 +469,12 @@ async def approve_campaign_plan(
             "content_review_status": "approved"
         }
 
+        store_json_to_s3(
+            bucket=S3_BUCKET,
+            key=f"campaigns/{username}/{campaign_name}/campaign_planner/response/approved_plan.json",
+            data=approved_plan_data
+        )
+
         update_agentic_campaign_planner(
             username=username,
             campaign_name=campaign_name,
@@ -512,7 +531,8 @@ async def submit_feedback(
 
         campaign_match = next((c for c in user_campaigns if (c.get('campaign_name', '') or '').lower() == campaign_name.lower()), None)
         if not campaign_match:
-            raise HTTPException(status_code=404, detail=f"Campaign '{campaign_name}' not found for user '{username}'")... if not feedback_request or not feedback_request.feedbacks:
+            raise HTTPException(status_code=404, detail=f"Campaign '{campaign_name}' not found for user '{username}'")
+        if not feedback_request or not feedback_request.feedbacks:
             raise HTTPException(status_code=400, detail="feedbacks list is required and cannot be empty")
 
         # Deduplicate feedbacks
@@ -610,7 +630,9 @@ async def submit_feedback(
 
         # Enhanced Feedback Processing (original logic retained with minor cleanups)
         version_number = 0
-        processed_post_ids: List[str] = []... def classify_feedback_strength(feedback_text: str) -> str:
+        processed_post_ids: List[str] = []
+
+        def classify_feedback_strength(feedback_text: str) -> str:
             feedback_lower = feedback_text.lower()
             strong_indicators = ["completely rewrite", "totally different", "start over", "completely change"]
             medium_indicators = ["improve", "enhance", "better", "more", "add", "include"]
@@ -710,7 +732,8 @@ async def submit_feedback(
             })
             current_regen_attempts[pid_norm] = current_attempts + 1
             feedback_dict["current_regen_attempts"] = current_regen_attempts
-            human_feedback_map[post_id] = fb_text... version_number = current_regen_attempts.get(pid_norm, 1)
+            human_feedback_map[post_id] = fb_text
+            version_number = current_regen_attempts.get(pid_norm, 1)
             processed_post_ids.append(post_id)
 
             # Enhanced regeneration
@@ -817,7 +840,9 @@ async def submit_feedback(
             merged_node["feedback_strength"] = feedback_strength
             merged_node["temperature_used"] = temperature
 
-            full_plan[platform_key][week_key][day_key] = merged_node... # Store variant for future similarity checking
+            full_plan[platform_key][week_key][day_key] = merged_node
+
+            # Store variant for future similarity checking
             pv_map = feedback_dict.setdefault("previous_variants", {})
             pv_list = pv_map.get(pid_norm, [])
             variant_snapshot = {
