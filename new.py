@@ -31,6 +31,17 @@ def content_similarity_check(new_content: str, previous_variants: List[Dict]) ->
             return False
     return True
 
+def safe_truncate(value: str, max_length: int = 8000) -> str:
+    """
+    Truncate string to fit DB column size, preventing 'data would be truncated' error.
+    Adjust max_length based on your actual DB schema (e.g., varchar(8000)).
+    """
+    if len(value) > max_length:
+        truncated = value[:max_length - 3] + "..."
+        logger.warning(f"Truncated string from {len(value)} to {max_length} chars to avoid DB truncation error.")
+        return truncated
+    return value
+
 @router.post("/{username}/{campaign_name}/feedback")
 async def submit_feedback(
     username: str,
@@ -174,8 +185,8 @@ async def submit_feedback(
     update_agentic_campaign_planner(
         username=username,
         campaign_name=campaign_name,
-        approved_plan=json.dumps({"campaign_plan": full_plan}, ensure_ascii=False),
-        feedback_response=json.dumps(fb_store, ensure_ascii=False),
+        approved_plan=safe_truncate(json.dumps({"campaign_plan": full_plan}, ensure_ascii=False)),
+        feedback_response=safe_truncate(json.dumps(fb_store, ensure_ascii=False)),
         regeneration_count=version
     )
 
@@ -186,4 +197,3 @@ async def submit_feedback(
         "details": details,
         "excel_s3_url": excel_url
     }
-
