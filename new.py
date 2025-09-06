@@ -1,148 +1,177 @@
-@router.post("/{username}/{campaign_name}/approve", response_model=CampaignPlanResponse)
-async def approve_campaign_plan(
+from fastapi import APIRouter, HTTPException
+from typing import Dict, Any
+import json
+import copy
+import hashlib
+from datetime import datetime
+from src.models import MultiFeedbackRequest, State
+from .db_utils import fetch_campaign_responses, update_agentic_campaign_planner
+from .agent_graph import system_agents
+from utils.logger import logger
+
+router = APIRouter()
+
+@router.post("/{username}/{campaign_name}/feedback")
+async def submit_feedback(
     username: str,
-    campaign_name: str
-):
+    campaign_name: str,
+    feedback_request: MultiFeedbackRequest
+) -> Dict[str, Any]:
     """
-    Approve a campaign plan and generate full content (no images),
-    loading the existing plan directly from the database.
+    Batch feedback regeneration loading the stored plan from the database.
+    - Accepts list of feedback items: [{post_id, feedback_text}, ...]
+    - Applies feedback to the stored plan_response.campaign_plan
+    - Persists feedback_response and approved_plan_v{batch_version} in the DB
     """
     try:
-        logger.info(f"Approving campaign plan for user: {username}, campaign: {campaign_name}")
+        full_name = f"{username}/{campaign_name}"
+        logger.info(f"Processing feedback for {full_name}")
 
-        # Validate user
-        user_data = get_user_by_username(username)
-        if not user_data:
-            raise HTTPException(404, f"User '{username}' not found")
-
-        # Validate campaign exists
+        # Validate user & campaign
         user_campaigns = get_user_campaigns(username)
         if not any(c.get("campaign_name", "").lower() == campaign_name.lower() for c in user_campaigns):
-            raise HTTPException(404, f"Campaign '{campaign_name}' not found for user '{username}'")
+            raise HTTPException(404, "Campaign not found")
 
-        # Fetch stored plan_response JSON from DB
-        responses = fetch_campaign_responses(username, campaign_name)
-        if not responses or not responses.get("plan_response"):
-            raise HTTPException(404, f"No existing plan_response found for '{username}/{campaign_name}'")
+        # Deduplicate feedback items
+        deduped = []
+        seen = set()
+        for fb in feedback_request.feedbacks or []:
+            pid = fb.post_id.strip().lower()
+            if pid and pid not in seen:
+                seen.add(pid)
+                deduped.append(fb)
+        if not deduped:
+            raise HTTPException(400, "No valid feedback items provided")
 
-        # Parse plan_response into dict
-        stored = responses["plan_response"]
-        if isinstance(stored, str):
+        # 1. Load stored plan_response from DB
+        db_resp = fetch_campaign_responses(username, campaign_name)
+        if not db_resp or not db_resp.get("plan_response"):
+            raise HTTPException(404, "No stored plan_response found")
+        plan_obj = db_resp["plan_response"]
+        if isinstance(plan_obj, str):
             try:
-                stored = json.loads(stored)
-            except Exception:
-                raise HTTPException(500, "Invalid JSON in stored plan_response")
+                plan_obj = json.loads(plan_obj)
+            except json.JSONDecodeError:
+                raise HTTPException(500, "Invalid stored plan_response JSON")
 
-        # Validate required fields
-        required = ["campaign_name","campaign_objective","campaign_description",
-                    "start_date","end_date","target_audience","platforms","campaign_plan"]
-        missing = [f for f in required if f not in stored]
-        if missing:
-            raise HTTPException(400, f"Stored plan missing: {missing}")
-
-        # Normalize audience_info
-        tai = stored.get("target_audience_info", [])
-        if isinstance(tai, str):
-            try:
-                tai = json.loads(tai)
-            except:
-                tai = [e.strip() for e in tai.split(",") if e.strip()]
-
-        # Date validation
-        date_info = calculate_date_info(stored["start_date"], stored["end_date"])
-        if "error" in date_info:
-            raise HTTPException(400, date_info["error"])
-
-        # Validate platforms
-        platforms = [p for p in stored.get("platforms", []) if p in ALLOWED_PLATFORMS]
-        if not platforms:
-            raise HTTPException(400, "No valid platforms in stored plan")
-
-        # Retrieve the plan dict
-        campaign_plan = stored["campaign_plan"]
+        # Extract campaign_plan dict
+        campaign_plan = plan_obj.get("campaign_plan")
         if isinstance(campaign_plan, str):
             campaign_plan = json.loads(campaign_plan)
 
-        # Build approval state
-        approval_state = State(
-            campaign_name=stored["campaign_name"],
-            campaign_objective=stored["campaign_objective"],
-            campaign_description=stored["campaign_description"],
-            start_date=stored["start_date"],
-            end_date=stored["end_date"],
-            target_audience=stored["target_audience"],
-            target_audience_info=tai,
-            target_audience_location=stored.get("target_audience_location",""),
-            base_plan_dict=copy.deepcopy(date_info["week_mapping"]),
-            platforms=platforms,
-            stage="content_generation",
-            plan_approved=True,
-            generate_images=False,
-            max_regen_attempts=3,
-            current_regen_attempts={},
-            campaign_plan=campaign_plan,
-            messages=[],
-            current_step="approval"
-        )
-
-        # Generate full content
-        final_state = await system_agents.ainvoke(approval_state)
-        state_dict = dict(final_state)
-        full_plan = state_dict.get("campaign_plan")
-        if not full_plan:
-            raise HTTPException(404, "Content generation failed after approval")
-
-        # Sanitize images field
-        def sanitize(obj):
-            if isinstance(obj, dict):
-                return {k: (sanitize(v) if k.lower() not in 
-                             ("images","image_base64","image_s3_key") else [])
-                        for k,v in obj.items()}
-            if isinstance(obj, list):
-                return [sanitize(i) for i in obj]
-            return obj
-
-        full_plan = sanitize(full_plan)
-
-        # Upload Excel
-        excel_url = generate_and_upload_combined_excel_to_s3(full_plan, f"{username}/{campaign_name}", S3_BUCKET)
-        if not excel_url:
-            raise HTTPException(500, "Excel upload failed")
-
-        # Store approve_response in DB
-        approve_data = {
-            **stored,
-            "campaign_plan": full_plan,
-            "current_step": state_dict.get("current_step","completed"),
-            "messages": state_dict.get("messages",[]),
-            "stage":"content_generation",
-            "plan_approved":True,
-            "excel_s3_url":excel_url,
-            "content_review_status":"approved"
+        # Prepare feedback tracking structure
+        feedback_dict = {
+            "campaign_name": full_name,
+            "feedback_history": [],
+            "current_regen_attempts": {},
+            "approved_plan_versions": [],
+            "previous_variants": {}
         }
+
+        details: Dict[str, Any] = {}
+        human_map: Dict[str, str] = {}
+
+        # Helper functions
+        def classify_strength(text: str) -> str:
+            t = text.lower()
+            if any(k in t for k in ["completely rewrite", "start over"]):
+                return "strong"
+            if any(k in t for k in ["improve", "better", "enhance"]):
+                return "medium"
+            return "light"
+
+        def progressive_temp(attempt: int, strength: str) -> float:
+            base = {"light": 0.8, "medium": 0.85, "strong": 0.9}[strength]
+            return min(base + 0.1 * (attempt - 1), 0.95)
+
+        def make_seed(pid: str, attempt: int, text: str) -> str:
+            return hashlib.sha256(f"{pid}|{attempt}|{text[:50]}".encode()).hexdigest()
+
+        def apply_injection():
+            # No-op: final updated campaign_plan will replace stored one
+            pass
+
+        # 2. Process each feedback item
+        for fb in deduped:
+            pid = fb.post_id.strip().lower()
+            feedback_text = fb.feedback_text.strip()
+            human_map[pid] = feedback_text
+
+            # Track attempts
+            curr = feedback_dict["current_regen_attempts"].get(pid, 0) + 1
+            feedback_dict["current_regen_attempts"][pid] = curr
+            feedback_dict["feedback_history"].append({
+                "post_id": pid,
+                "feedback_text": feedback_text,
+                "attempt": curr,
+                "timestamp": datetime.utcnow().isoformat()
+            })
+
+            strength = classify_strength(feedback_text)
+            temp = progressive_temp(curr, strength)
+            seed = make_seed(pid, curr, feedback_text)
+
+            # Build state for regeneration
+            state = State(
+                campaign_name=full_name,
+                campaign_plan=campaign_plan,
+                plan_approved=True,
+                stage="content_generation",
+                current_post_id=pid,
+                regen_attempt_number=curr,
+                human_feedback_text=feedback_text,
+                feedback_strength=strength,
+                temperature_override=temp,
+                random_seed=seed,
+                previous_variants=feedback_dict["previous_variants"]
+            )
+
+            # Invoke regeneration
+            final_state = await system_agents.ainvoke(state)
+            result_plan = dict(final_state).get("campaign_plan", {})
+
+            # Update campaign_plan in place
+            campaign_plan.update(result_plan)
+            feedback_dict["previous_variants"].setdefault(pid, []).append({
+                "content": campaign_plan.get(pid, {}),
+                "attempt": curr,
+                "timestamp": datetime.utcnow().isoformat()
+            })
+            details[pid] = {"success": True, "attempt": curr}
+
+        # 3. Build approved_plan_data
+        batch_version = max(feedback_dict["current_regen_attempts"].values(), default=1)
+        approved_plan_data = {
+            **plan_obj,
+            "campaign_plan": campaign_plan,
+            "feedback_map": human_map,
+            "batch_version": batch_version,
+            "excel_s3_url": None  # set if you upload Excel here
+        }
+
+        # 4. Persist feedback_response and approved_plan_v{n}
         update_agentic_campaign_planner(
             username=username,
             campaign_name=campaign_name,
-            approve_response=json.dumps(approve_data, ensure_ascii=False),
-            approved_plan=True
+            feedback_response=json.dumps({
+                "feedback": feedback_dict,
+                "approved_plan": approved_plan_data,
+                "details": details
+            }, ensure_ascii=False),
+            **{f"approved_plan_v{batch_version}": json.dumps(approved_plan_data, ensure_ascii=False)}
         )
 
-        return CampaignPlanResponse(
-            campaign_name=stored["campaign_name"],
-            success=True,
-            campaign_plan=full_plan,
-            platforms=platforms,
-            uploaded_images=[],
-            generated_images=[],
-            total_images=0,
-            content_review_status="approved",
-            message=f"Campaign approved. Excel: {excel_url}",
-            image_generation_status="skipped",
-            target_audience_location=stored.get("target_audience_location","")
-        )
+        # 5. Return response
+        return {
+            "campaign_name": full_name,
+            "success": True,
+            "batch_version": batch_version,
+            "approved_plan": approved_plan_data,
+            "details": details
+        }
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error approving campaign plan: {e}")
-        raise HTTPException(500, "Error approving campaign plan") 
+        logger.error(f"Error in submit_feedback: {e}")
+        raise HTTPException(500, "Error processing feedback")
