@@ -33,26 +33,32 @@ else:
     owner, table_name = "dbo", table
 
 try:
-    # Create the table if it doesn't exist
+    # Drop the table if it exists
+    drop_table_query = f"""
+    IF OBJECT_ID('{owner}.{table_name}', 'U') IS NOT NULL
+        DROP TABLE {owner}.{table_name};
+    """
+    cursor.execute(drop_table_query)
+    conn.commit()
+    print(f"Existing table {owner}.{table_name} dropped.")
+
+    # Create the table
     create_table_query = f"""
-    IF OBJECT_ID('{owner}.{table_name}', 'U') IS NULL
-    BEGIN
-        CREATE TABLE {owner}.{table_name} (
-            id INT IDENTITY(1,1) PRIMARY KEY,
-            username NVARCHAR(255) NOT NULL,
-            campaign_name NVARCHAR(255) NOT NULL,
-            post_id NVARCHAR(255) NOT NULL,
-            image_base64 NVARCHAR(MAX) NULL,
-            image_s3_key NVARCHAR(MAX) NULL,
-            prompt_used NVARCHAR(MAX) NULL,
-            generation_model NVARCHAR(255) NULL,
-            created_at DATETIME DEFAULT GETDATE()
-        );
-    END
+    CREATE TABLE {owner}.{table_name} (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        username NVARCHAR(255) NOT NULL,
+        campaign_name NVARCHAR(255) NOT NULL,
+        post_id NVARCHAR(255) NOT NULL,
+        image_base64 NVARCHAR(MAX) NULL,
+        image_s3_key NVARCHAR(MAX) NULL,
+        prompt_used NVARCHAR(MAX) NULL,
+        generation_model NVARCHAR(255) NULL,
+        created_at DATETIME DEFAULT GETDATE()
+    );
     """
     cursor.execute(create_table_query)
     conn.commit()
-    print(f"Table {owner}.{table_name} created or already exists.")
+    print(f"Table {owner}.{table_name} created.")
 
     # Parameterized call to avoid quoting issues
     cursor.execute(
@@ -71,7 +77,7 @@ try:
             print(f"- {column_name} ({data_type})")
 
 except Exception as e:
-    print("Failed to create table or retrieve columns:", e)
+    print("Failed to drop/create table or retrieve columns:", e)
 finally:
     try:
         if cursor is not None:
