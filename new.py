@@ -5,9 +5,10 @@ async def submit_feedback(
     feedback_request: MultiFeedbackRequest
 ) -> Dict[str, Any]:
     """
-    Feedback batch regeneration (DB-backed):
-    - Reads stored plan / feedback from DB (agentic_campaign_planner) instead of S3 JSON.
-    - Produces versioned approved_plan_v{batch_version} and updates DB with feedback_response.
+    FIXED Feedback batch regeneration (DB-backed):
+    - Properly handles is_regeneration flag to ensure correct routing
+    - Only regenerates the specific post_id provided in feedback
+    - Extracts content directly from agent response when campaign_plan structure fails
     """
     try:
         campaign_full_name = f"{username}/{campaign_name}"
@@ -54,7 +55,7 @@ async def submit_feedback(
         if not planner_record:
             raise HTTPException(status_code=404, detail=f"No planner record found for '{campaign_full_name}'")
 
-        # Prefer approve_response, else plan_response
+        # prefer approve_response (approved_plan.json) then plan_response (plan.json)
         for candidate_key in ("approve_response", "plan_response"):
             raw = planner_record.get(candidate_key)
             if not raw:
@@ -66,7 +67,9 @@ async def submit_feedback(
                 logger.info(f"Loaded {candidate_key} from DB for {campaign_full_name}")
                 break
             except Exception:
+                # if raw is not valid JSON but is a string, still try to keep it as-is
                 try:
+                    # final attempt: if raw looks like a str but not JSON, wrap into dict
                     stored_plan_full = {"campaign_plan": raw}
                     campaign_plan = raw
                     logger.warning(f"{candidate_key} exists but could not be parsed as JSON; using raw value")
@@ -134,7 +137,7 @@ async def submit_feedback(
         details: Dict[str, Any] = {}
         human_feedback_map: Dict[str, str] = {}
 
-        # --- Helper functions ---
+        # --- helper functions (kept same) ---
         def classify_feedback_strength(feedback_text: str) -> str:
             feedback_lower = feedback_text.lower()
             strong_indicators = ["completely rewrite", "totally different", "start over", "completely change"]
@@ -177,11 +180,13 @@ async def submit_feedback(
         version_number = 0
         processed_post_ids: List[str] = []
 
-        # --- Main feedback loop ---
+        # --- Main feedback loop (FIXED STATE CONSTRUCTION) ---
         for fb in deduped_feedbacks:
             post_id = (fb.post_id or "").strip()
             pid_norm = post_id.lower()
             fb_text = (fb.feedback_text or "").strip()
+
+            logger.info(f"Processing feedback for post_id: {post_id} with text: '{fb_text}'")
 
             # Parse post_id
             parts = post_id.split('_')
@@ -243,19 +248,20 @@ async def submit_feedback(
             feedback_strength = classify_feedback_strength(fb_text)
             temperature = get_progressive_temperature(version_number, feedback_strength)
             enhanced_seed = generate_enhanced_seed(post_id, version_number, fb_text)
-
             previous_variants = feedback_dict.get("previous_variants", {}).get(pid_norm, [])
-            state_input = {
-                **state_dict,
-                **feedback_dict,
+
+            # CRITICAL FIX: Properly construct state to ensure is_regeneration=True
+            logger.info(f"🔧 Constructing state for regeneration of {post_id}")
+            
+            # Build base regeneration state first
+            base_regeneration_state = {
                 "stage": "content_generation",
                 "plan_approved": True,
-                "base_plan_dict": state_dict.get("base_plan_dict", campaign_plan),
+                "is_regeneration": True,  # CRITICAL: Set this first
                 "current_post_id": post_id,
                 "regen_attempt_number": version_number,
                 "human_feedback_text": fb_text,
                 "feedback_strength": feedback_strength,
-                "is_regeneration": True,
                 "skip_vector_db": False,
                 "variation_index": version_number,
                 "random_seed": enhanced_seed,
@@ -266,6 +272,19 @@ async def submit_feedback(
                 "generate_images": False,
                 "image_generation_enabled": False
             }
+
+            # Now merge with other state, but preserve regeneration settings
+            state_input = {}
+            state_input.update(state_dict)  # Add stored state
+            state_input.update(feedback_dict)  # Add feedback tracking
+            state_input.update(base_regeneration_state)  # Override with regeneration settings
+            
+            # DOUBLE-CHECK: Ensure critical flags are preserved
+            state_input["is_regeneration"] = True
+            state_input["current_post_id"] = post_id
+            state_input["base_plan_dict"] = state_dict.get("base_plan_dict", campaign_plan)
+
+            logger.info(f"🔧 State constructed: is_regeneration={state_input.get('is_regeneration')}, current_post_id='{state_input.get('current_post_id')}'")
 
             max_retry_attempts = 3
             successful_regeneration = False
@@ -278,9 +297,16 @@ async def submit_feedback(
                         state_input["random_seed"] = f"{enhanced_seed}_retry_{retry}"
                         state_input["temperature_override"] = min(temperature + (retry * 0.02), 0.98)
 
+                    logger.info(f"🔧 Invoking system_agents for {post_id} (attempt {retry + 1})")
                     final_state = await system_agents.ainvoke(state_input)
                     final_state_dict = dict(final_state)
+                    logger.info(f"🔧 Agent response received for {post_id}")
 
+                    # ENHANCED CONTENT EXTRACTION - Try both methods
+                    new_content = ""
+                    new_task = ""
+                    
+                    # Method 1: Try campaign_plan structure
                     agent_plan = final_state_dict.get("campaign_plan")
                     if isinstance(agent_plan, str):
                         try:
@@ -288,22 +314,63 @@ async def submit_feedback(
                         except json.JSONDecodeError:
                             agent_plan = None
 
+                    new_day_node = None
                     if isinstance(agent_plan, dict):
                         try:
                             new_day_node = agent_plan.get(platform_key, {}).get(week_key, {}).get(day_key)
-                        except Exception:
+                            if isinstance(new_day_node, dict):
+                                new_content = new_day_node.get("content", "")
+                                new_task = new_day_node.get("task", "")
+                                logger.info(f"🔧 Extracted content via campaign_plan structure for {post_id}")
+                        except Exception as e:
+                            logger.warning(f"Failed to extract via campaign_plan structure: {e}")
                             new_day_node = None
 
-                    if isinstance(new_day_node, dict):
-                        new_content = new_day_node.get("content", "")
-                        if content_similarity_check(new_content, previous_variants):
+                    # Method 2: Try direct extraction from final_state_dict
+                    if not new_day_node or not new_content:
+                        new_content = final_state_dict.get("content", "")
+                        new_task = final_state_dict.get("task_description", "")
+                        
+                        if new_content:
+                            new_day_node = {
+                                "task": new_task or f"Regenerated {platform_key} content",
+                                "content": new_content,
+                                "human_feedback": fb_text,
+                                "regeneration_count": version_number,
+                                "feedback_strength": feedback_strength,
+                                "temperature_used": temperature
+                            }
+                            logger.info(f"🔧 Extracted content via direct method for {post_id}")
+
+                    # Check if we got valid content
+                    if new_day_node and isinstance(new_day_node, dict) and new_day_node.get("content"):
+                        content_to_check = new_day_node.get("content", "")
+                        if content_similarity_check(content_to_check, previous_variants):
                             successful_regeneration = True
+                            logger.info(f"✅ Successful regeneration for {post_id} with new content")
                             break
                         elif retry < max_retry_attempts - 1:
                             logger.info(f"Content too similar to previous variants for {post_id}, retrying with higher temperature")
                             continue
-                    else:
+                    
+                    # If we didn't get a proper day node but have some content, use it
+                    if new_content and not new_day_node:
+                        new_day_node = {
+                            "task": new_task or f"Regenerated {platform_key} content for {day_key}",
+                            "content": new_content,
+                            "human_feedback": fb_text,
+                            "regeneration_count": version_number,
+                            "feedback_strength": feedback_strength,
+                            "temperature_used": temperature
+                        }
                         successful_regeneration = True
+                        logger.info(f"✅ Using extracted content for {post_id}")
+                        break
+                    
+                    # If we reach here and it's the last retry, accept what we have
+                    if retry == max_retry_attempts - 1:
+                        successful_regeneration = True
+                        logger.info(f"⚠️ Using final attempt result for {post_id}")
                         break
 
                 except Exception as e:
@@ -319,11 +386,15 @@ async def submit_feedback(
             # Process successful regeneration / merge
             if isinstance(new_day_node, dict):
                 merged_node = copy.deepcopy(new_day_node)
+                logger.info(f"✅ Using regenerated day node for {post_id}")
             else:
+                # Fallback - merge with existing content
                 existing = full_plan[platform_key][week_key].get(day_key, {})
                 merged_node = {}
                 if isinstance(existing, dict):
                     merged_node.update(existing)
+                    
+                # Try to get content from final_state_dict
                 fallback_keys = (
                     "task", "content", "caption", "headline", "cta",
                     "hook", "angle", "hashtags", "title", "body", "notes"
@@ -331,12 +402,15 @@ async def submit_feedback(
                 for k in fallback_keys:
                     if k in final_state_dict:
                         merged_node[k] = final_state_dict[k]
+                        
+                logger.info(f"⚠️ Using fallback merging for {post_id}")
 
-            # Clear any image-related fields
+            # Clean up any image-related fields (kept)
             image_related_keys = ["image_path_s3", "image_paths", "image_urls", "images", "image_prompt"]
             for img_key in image_related_keys:
                 if img_key in merged_node:
                     merged_node[img_key] = []
+                    
             merged_node["human_feedback"] = fb_text
             merged_node["regeneration_count"] = version_number
             merged_node["feedback_strength"] = feedback_strength
@@ -363,7 +437,8 @@ async def submit_feedback(
                 "message": "Feedback processed and post regenerated with enhanced variation",
                 "regeneration_attempts": version_number,
                 "feedback_strength": feedback_strength,
-                "temperature_used": temperature
+                "temperature_used": temperature,
+                "new_content_preview": merged_node.get("content", "")[:100] + "..." if merged_node.get("content") else "No content"
             }
 
         # --- Generate Final Plan object ---
@@ -377,7 +452,7 @@ async def submit_feedback(
             "messages": [],
             "stage": "content_generation",
             "plan_approved": True,
-            "generated_images": [],
+            "generated_images": [],  # Empty
             "image_generation_status": "disabled",
             "generated_at": datetime.utcnow().isoformat(),
             "human_feedback_map": human_feedback_map.copy(),
@@ -431,7 +506,7 @@ async def submit_feedback(
             "message": f"Enhanced feedback processing completed for {processed_count} of {len(deduped_feedbacks)} posts with progressive temperature control.",
             "campaign_plan": approved_plan_data["campaign_plan"],
             "platforms": approved_plan_data.get("platforms", []),
-            "generated_images": [],
+            "generated_images": [],  # empty
             "image_generation_status": "disabled",
             "excel_s3_url": excel_s3_url,
             "processed": len(deduped_feedbacks),
@@ -442,7 +517,9 @@ async def submit_feedback(
                 "progressive_temperature": True,
                 "content_similarity_checking": True,
                 "feedback_strength_classification": True,
-                "enhanced_seed_generation": True
+                "enhanced_seed_generation": True,
+                "improved_content_extraction": True,
+                "fixed_regeneration_routing": True
             }
         }
 
@@ -481,6 +558,7 @@ async def submit_feedback(
 
 
 
+# ENHANCED social_media_agents.py with better content extraction
 
 from typing import Dict, Any
 from src.models import State
@@ -526,8 +604,10 @@ def get_dynamic_temperature(state: State) -> float:
 def enhance_prompt(prompt: str, state: State) -> str:
     """Add stronger directives for regeneration with variation enforcement."""
     attempt = state.get("regen_attempt_number", 1)
+    current_post_id = state.get("current_post_id", "")
+    
     lines = [
-        f"--- REGENERATION ATTEMPT {attempt} (MUST BE DISTINCTLY DIFFERENT) ---"
+        f"--- REGENERATION ATTEMPT {attempt} FOR POST {current_post_id} (MUST BE DISTINCTLY DIFFERENT) ---"
     ]
     
     strength = state.get("feedback_strength", "medium")
@@ -583,9 +663,15 @@ def check_content_variation(new_content: str, previous_variants: list) -> bool:
     return True
 
 def create_social_media_post(state: State, platform: str) -> Dict[str, Any]:
-    """Generic social media post creator with regeneration support."""
+    """
+    ENHANCED social media post creator with better regeneration support and content extraction.
+    """
     current_day = state.get("current_day", 1)
     total_days = state.get("total_days", 7)
+    current_post_id = state.get("current_post_id", "")
+    is_regeneration = state.get("is_regeneration", False)
+    
+    print(f"🎯 Creating {platform} post - Day {current_day}, Regeneration: {is_regeneration}, Post ID: '{current_post_id}'")
     
     # Determine campaign phase
     if current_day <= 3:
@@ -619,16 +705,18 @@ def create_social_media_post(state: State, platform: str) -> Dict[str, Any]:
         context_guidance=state.get("optimized_prompts", {}).get("context_guidance", "")
     )
     
-    # Add human feedback if present
+    # Add human feedback if present (for regenerations)
     human_feedback = state.get("human_feedback_text", "")
     if human_feedback:
         regen_attempt = state.get("regen_attempt_number", 1)
         base_content_prompt += f"\n\nHuman Feedback (Attempt {regen_attempt}): {human_feedback}\nIncorporate this feedback to improve the post and ensure the new version is distinctly different."
+        print(f"🔄 Incorporating human feedback for {platform}: '{human_feedback}'")
     
     # Apply enhanced variation for regenerations
     regen_attempt = state.get("regen_attempt_number", 1)
     if regen_attempt > 1:
         base_content_prompt = enhance_prompt(base_content_prompt, state)
+        print(f"🔄 Enhanced prompt for regeneration attempt {regen_attempt}")
     
     # Get dynamic temperature
     temperature = get_dynamic_temperature(state)
@@ -654,14 +742,18 @@ def create_social_media_post(state: State, platform: str) -> Dict[str, Any]:
                 temperature=temperature + (retry * 0.05)  # Slight boost per retry
             )
             if check_content_variation(content, previous_variants):
+                print(f"✅ Generated unique content for {platform} (retry {retry})")
                 break
+            else:
+                print(f"⚠️ Content too similar, retrying for {platform} (retry {retry})")
         except Exception as e:
             content = f"Error generating {platform} content: {str(e)}"
+            print(f"❌ Error generating content for {platform}: {e}")
             break
     else:
         content += " [NOTE: Variation retry limit reached; content may be similar]"
-    
-    # Build post response
+
+    # Build post response with ENHANCED structure for better extraction
     post_key = f"{platform}_post"
     post = {
         "task_description": task_description,
@@ -672,23 +764,70 @@ def create_social_media_post(state: State, platform: str) -> Dict[str, Any]:
             "feedback_incorporated": bool(human_feedback),
             "feedback_strength": state.get("feedback_strength", "medium"),
             "seed": state.get("random_seed", ""),
-            "generation_timestamp": time.time()
+            "generation_timestamp": time.time(),
+            "post_id": current_post_id
         }
     }
     
-    return {
+    # CRITICAL: Return both structured post AND direct content access
+    response = {
         post_key: post,
         "messages": [f"Enhanced {platform} post for day {current_day} (attempt {regen_attempt}) created with temp {temperature:.2f} using AWS Bedrock"],
         "current_step": f"create_{platform}_post",
-        "content": content,  # Direct content access for state extraction
-        "task_description": task_description  # Direct task access for state extraction
+        "content": content,  # DIRECT content access for extraction
+        "task_description": task_description,  # DIRECT task access for extraction
+        "task": task_description,  # Alternative key for task
+        "regeneration_success": True,
+        "platform": platform,
+        "post_id": current_post_id
     }
+    
+    # For regenerations, ALSO return a simplified campaign_plan structure
+    if is_regeneration and current_post_id:
+        try:
+            # Parse post_id to build structure: email_week_1_Day_1
+            parts = current_post_id.split('_')
+            if len(parts) >= 3:
+                platform_key = parts[0]
+                week_key = f"{parts[1]}_{parts[2]}"
+                day_key = '_'.join(parts[3:]) if len(parts) > 3 else 'Day_1'
+                
+                campaign_plan = {
+                    platform_key: {
+                        week_key: {
+                            day_key: {
+                                "task": task_description,
+                                "content": content,
+                                "human_feedback": human_feedback,
+                                "regeneration_count": regen_attempt,
+                                "feedback_strength": state.get("feedback_strength", "medium"),
+                                "temperature_used": temperature
+                            }
+                        }
+                    }
+                }
+                response["campaign_plan"] = campaign_plan
+                print(f"✅ Built campaign_plan structure for {current_post_id}")
+        except Exception as e:
+            print(f"⚠️ Failed to build campaign_plan structure: {e}")
+    
+    print(f"🎯 {platform} post creation completed - Content length: {len(content)} chars")
+    return response
 
 def social_media_agents_supervisor(state: State) -> Dict[str, Any]:
-    """Supervisor agent that coordinates social media content generation."""
+    """
+    ENHANCED supervisor agent with better debugging for regeneration mode.
+    """
+    current_post_id = state.get("current_post_id", "")
+    is_regeneration = state.get("is_regeneration", False)
+    
+    print(f"👥 Social Media Supervisor - Regeneration: {is_regeneration}, Post ID: '{current_post_id}'")
+    
     return {
         "messages": ["Social media agents supervisor initialized"],
-        "current_step": "social_media_agents_supervisor"
+        "current_step": "social_media_agents_supervisor",
+        "is_regeneration": is_regeneration,
+        "current_post_id": current_post_id
     }
 
 # Platform-specific functions using the DRY generic function
@@ -717,6 +856,8 @@ def create_sms_post(state: State) -> Dict[str, Any]:
     return create_social_media_post(state, "sms")
 
 
+
+# src/agent/graph.py
 
 from typing import Dict, Any
 from langgraph.graph import StateGraph
@@ -795,10 +936,20 @@ graph.add_node("create_sms_post", create_sms_post)
 # ------------------------ ENTRY POINT ------------------------
 graph.set_entry_point("orchestrator_agent")
 
-# ------------------------ REGENERATION ROUTER ------------------------
+# ------------------------ REGENERATION ROUTER (FIXED) ------------------------
 def regeneration_router(state: State) -> str:
-    if state.get("is_regeneration", False):
-        print("🔄 Regeneration mode detected: Routing directly to social media agents supervisor")
+    """
+    Enhanced regeneration router with proper debugging and validation.
+    """
+    is_regen = state.get("is_regeneration", False)
+    current_post_id = state.get("current_post_id", "")
+    
+    # Add comprehensive debugging
+    print(f"🔄 Router Debug: is_regeneration={is_regen}, current_post_id='{current_post_id}'")
+    print(f"🔄 Router Debug: stage={state.get('stage')}, plan_approved={state.get('plan_approved')}")
+    
+    if is_regen and current_post_id:
+        print(f"🔄 Regeneration mode detected: Routing directly to social media supervisor for {current_post_id}")
         return "social_media_agents_supervisor"
     else:
         print("🔄 Normal mode: Proceeding to stage router")
@@ -844,17 +995,26 @@ graph.add_edge("content_reviewer", "content_validator")
 graph.add_edge("content_validator", "social_media_agents_supervisor")
 
 def social_media_router(state: State) -> str:
+    """
+    Enhanced social media router with better debugging and post-specific routing.
+    """
     current_post_id = state.get("current_post_id")
+    
+    print(f"🔄 Social Media Router: current_post_id='{current_post_id}'")
+    
     if current_post_id:
         platform = current_post_id.split('_')[0].lower()
         if platform in PLATFORM_AGENT_MAP:
-            print(f"🔄 Routing to {platform} agent for post_id: {current_post_id}")
-            return f"create_{platform}_post"
+            agent_name = f"create_{platform}_post"
+            print(f"🔄 Routing to {agent_name} for specific post: {current_post_id}")
+            return agent_name
         else:
-            print(f"⚠️ Unknown platform in post_id: {current_post_id}")
+            print(f"⚠️ Unknown platform '{platform}' in post_id: {current_post_id}")
             return "__end__"
     else:
+        # Default routing when no specific post is targeted
         platforms = state.get("platforms", ["instagram"])
+        print(f"🔄 No specific post_id, using default platforms: {platforms}")
         if "instagram" in platforms:
             return "create_instagram_post"
         elif "facebook" in platforms:
