@@ -1,3 +1,49 @@
+import copy
+import hashlib
+from typing import Dict, List, Any, Optional
+from datetime import datetime
+from fastapi import HTTPException
+import json
+from utils.logger import logger
+
+# --- New helper: fetch stored planner record from DB (plan/approve/feedback fields) ---
+def get_agentic_planner_record(username: str, campaign_name: str) -> Optional[Dict[str, Any]]:
+    """
+    Returns a dict containing plan_response, approve_response, feedback_response,
+    approved_plan_v1/2/3 and human_feedback_v1/2/3 if present in DB.
+    """
+    query = text("""
+        SELECT
+            plan_response,
+            approve_response,
+            feedback_response,
+            approved_plan_v1,
+            approved_plan_v2,
+            approved_plan_v3,
+            human_feedback_v1,
+            human_feedback_v2,
+            human_feedback_v3
+        FROM agentic_campaign_planner
+        WHERE TRIM(LOWER(username)) = TRIM(LOWER(:username))
+          AND TRIM(LOWER(campaign_name)) = TRIM(LOWER(:campaign_name))
+    """)
+    params = {"username": username, "campaign_name": campaign_name}
+    result = execute_query(query, params=params, fetch_one=True)
+    if not result:
+        return None
+    return {
+        "plan_response": result[0],
+        "approve_response": result[1],
+        "feedback_response": result[2],
+        "approved_plan_v1": result[3],
+        "approved_plan_v2": result[4],
+        "approved_plan_v3": result[5],
+        "human_feedback_v1": result[6],
+        "human_feedback_v2": result[7],
+        "human_feedback_v3": result[8],
+    }
+
+# --- Updated submit_feedback (DB-based, no S3 JSON reads) ---
 @router.post("/{username}/{campaign_name}/feedback")
 async def submit_feedback(
     username: str,
@@ -47,40 +93,31 @@ async def submit_feedback(
         if not deduped_feedbacks:
             raise HTTPException(status_code=400, detail="No valid, unique post_ids provided in feedbacks")
 
-        # --- Load plan/approve/feedback records from DB (agentic_campaign_planner) ---
-        query = text("""
-            SELECT plan_response, approve_response, feedback_response
-            FROM agentic_campaign_planner
-            WHERE TRIM(LOWER(username)) = TRIM(LOWER(:username))
-              AND TRIM(LOWER(campaign_name)) = TRIM(LOWER(:campaign_name))
-        """)
-        row = execute_query(query, params={"username": username, "campaign_name": campaign_name}, fetch_one=True)
-        if not row:
-            raise HTTPException(status_code=404, detail=f"No planner record found for '{campaign_full_name}'")
-
-        plan_raw = row[0]
-        approve_raw = row[1]
-        fb_raw = row[2]
-
+        # --- Load plans and stored state from DB instead of S3 ---
         stored_plan_full = None
         campaign_plan = None
+        planner_record = get_agentic_planner_record(username=username, campaign_name=campaign_name)
+        if not planner_record:
+            raise HTTPException(status_code=404, detail=f"No planner record found for '{campaign_full_name}'")
 
-        # Prefer approve_response then plan_response (attempt to parse JSON)
-        for raw in (approve_raw, plan_raw):
+        # prefer approve_response (approved_plan.json) then plan_response (plan.json)
+        for candidate_key in ("approve_response", "plan_response"):
+            raw = planner_record.get(candidate_key)
             if not raw:
                 continue
             try:
                 parsed = raw if isinstance(raw, dict) else json.loads(raw)
                 stored_plan_full = parsed
                 campaign_plan = parsed.get("campaign_plan") or parsed.get("plan") or parsed.get("campaignPlan") or parsed
-                logger.info(f"Loaded plan data from DB for {campaign_full_name}")
+                logger.info(f"Loaded {candidate_key} from DB for {campaign_full_name}")
                 break
             except Exception:
-                # fallback to raw string/dict
+                # if raw is not valid JSON but is a string, still try to keep it as-is
                 try:
+                    # final attempt: if raw looks like a str but not JSON, wrap into dict
                     stored_plan_full = {"campaign_plan": raw}
                     campaign_plan = raw
-                    logger.warning("Plan raw exists but could not be parsed as JSON; using raw value")
+                    logger.warning(f"{candidate_key} exists but could not be parsed as JSON; using raw value")
                     break
                 except Exception:
                     continue
@@ -94,8 +131,9 @@ async def submit_feedback(
             except json.JSONDecodeError:
                 logger.warning("Stored campaign_plan is a string but not valid JSON; proceeding with original value")
 
-        # --- Load feedback tracking from db feedback_response (if present) or init default ---
+        # --- Load feedback tracking from DB (feedback_response) or init default ---
         feedback_dict = {}
+        fb_raw = planner_record.get("feedback_response")
         if fb_raw:
             try:
                 feedback_dict = fb_raw if isinstance(fb_raw, dict) else json.loads(fb_raw)
@@ -122,8 +160,9 @@ async def submit_feedback(
         feedback_dict["current_regen_attempts"] = normalized_attempts
         feedback_dict.setdefault("previous_variants", {})
 
-        # --- Load state (plan.json equivalent) from plan_response or fallback ---
+        # --- Load state (plan.json equivalent) from DB plan_response or fallback ---
         state_dict = {}
+        plan_raw = planner_record.get("plan_response")
         if plan_raw:
             try:
                 state_dict = plan_raw if isinstance(plan_raw, dict) else json.loads(plan_raw)
@@ -186,7 +225,7 @@ async def submit_feedback(
         version_number = 0
         processed_post_ids: List[str] = []
 
-        # --- Main feedback loop (unchanged logic, except DB-based read/write) ---
+        # --- Main feedback loop (unchanged logic, except reading/writing to DB instead of S3) ---
         for fb in deduped_feedbacks:
             post_id = (fb.post_id or "").strip()
             pid_norm = post_id.lower()
@@ -312,6 +351,7 @@ async def submit_feedback(
                             logger.info(f"Content too similar to previous variants for {post_id}, retrying with higher temperature")
                             continue
                     else:
+                        # If agent didn't return a day node, accept agent output if no error
                         successful_regeneration = True
                         break
 
@@ -393,7 +433,7 @@ async def submit_feedback(
             "batch_version": batch_version
         }
 
-        # Add metadata from state_dict then stored_plan_full then defaults
+        # Add metadata from stored plan (state_dict first, then stored_plan_full, then defaults)
         meta_defaults = {
             "campaign_objective": "",
             "campaign_description": "",
@@ -467,6 +507,7 @@ async def submit_feedback(
                 }, ensure_ascii=False),
                 "regeneration_count": version_number_for_db
             }
+            # store the whole response into approved_plan_v{n} if v1..v3
             if batch_version in {1, 2, 3}:
                 fields_to_update[f"approved_plan_v{batch_version}"] = json.dumps(response, ensure_ascii=False)
 
