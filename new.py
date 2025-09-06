@@ -1,3 +1,207 @@
+# COMPLETE FIXED src/agent/graph.py
+
+from typing import Dict, Any
+from langgraph.graph import StateGraph
+from src.models import State
+
+from src.campaign_agent.system_agents import (
+    orchestrator_agent,
+    system_agent_orchestrator,
+    prompt_optimization,
+    text_generator,
+    content_reviewer,
+    plan_generator,
+    content_validator,
+    web_search_tool,
+    PLATFORM_AGENT_MAP
+)
+
+from src.agent.campaign_agent.social_media_agents import (
+    social_media_agents_supervisor,
+    create_instagram_post,
+    create_facebook_post,
+    create_x_post,
+    create_whatsapp_post,
+    create_email_post,
+    create_sms_post
+)
+
+# ------------------------ BUILD GRAPH ------------------------
+graph = StateGraph(State)
+
+# ------------------------ SYSTEM AGENT NODES ------------------------
+graph.add_node("orchestrator_agent", orchestrator_agent)
+graph.add_node("system_agent_orchestrator", system_agent_orchestrator)
+
+def web_search_agent(state: State) -> Dict[str, Any]:
+    """Web search agent that uses the web search tool."""
+    campaign_objective = state.get("campaign_objective", "")
+    campaign_description = state.get("campaign_description", "")
+    target_audience = state.get("target_audience", "")
+
+    search_query = f"{campaign_objective} {campaign_description} {target_audience} marketing campaign trends 2024"
+
+    try:
+        search_results = web_search_tool.invoke(search_query)
+        return {
+            "messages": [f"Web search completed for: {search_query[:100]}..."],
+            "current_step": "web_search_agent",
+            "search_results": search_results,
+            "search_query": search_query
+        }
+    except Exception as e:
+        return {
+            "messages": [f"Web search failed: {str(e)}"],
+            "current_step": "web_search_agent",
+            "search_results": "No web search results available",
+            "search_query": search_query
+        }
+
+graph.add_node("web_search_agent", web_search_agent)
+graph.add_node("prompt_optimization", prompt_optimization)
+graph.add_node("text_generator", text_generator)
+# NOTE: image_generator node completely removed
+graph.add_node("content_reviewer", content_reviewer)
+graph.add_node("plan_generator", plan_generator)
+graph.add_node("content_validator", content_validator)
+
+# ------------------------ SOCIAL MEDIA AGENT NODES ------------------------
+graph.add_node("social_media_agents_supervisor", social_media_agents_supervisor)
+graph.add_node("create_instagram_post", create_instagram_post)
+graph.add_node("create_facebook_post", create_facebook_post)
+graph.add_node("create_x_post", create_x_post)
+graph.add_node("create_whatsapp_post", create_whatsapp_post)
+graph.add_node("create_email_post", create_email_post)
+graph.add_node("create_sms_post", create_sms_post)
+
+# ------------------------ ENTRY POINT ------------------------
+graph.set_entry_point("orchestrator_agent")
+
+# ------------------------ ENHANCED REGENERATION ROUTER ------------------------
+def regeneration_router(state: State) -> str:
+    """
+    FIXED Enhanced regeneration router with comprehensive debugging and validation.
+    """
+    is_regen = state.get("is_regeneration", False)
+    current_post_id = state.get("current_post_id", "")
+    stage = state.get("stage", "")
+    plan_approved = state.get("plan_approved", False)
+    
+    # Add comprehensive debugging
+    print(f"🔄 Router Debug: is_regeneration={is_regen}, current_post_id='{current_post_id}'")
+    print(f"🔄 Router Debug: stage={stage}, plan_approved={plan_approved}")
+    
+    if is_regen and current_post_id:
+        print(f"🔄 Regeneration mode detected: Routing directly to social media supervisor for {current_post_id}")
+        return "social_media_agents_supervisor"
+    else:
+        print("🔄 Normal mode: Proceeding to stage router")
+        return stage_router(state)
+
+graph.add_conditional_edges(
+    "orchestrator_agent",
+    regeneration_router,
+    {
+        "social_media_agents_supervisor": "social_media_agents_supervisor",
+        "plan_generator": "plan_generator",
+        "system_agent_orchestrator": "system_agent_orchestrator"
+    }
+)
+
+# ------------------------ STAGE ROUTING ------------------------
+def stage_router(state: State) -> str:
+    current_stage = state.get("stage", "plan_generation")
+    plan_approved = state.get("plan_approved", False)
+    print(f"🔄 Stage Router: current_stage={current_stage}, plan_approved={plan_approved}")
+    if current_stage == "plan_generation":
+        print("📋 Routing to plan_generator for plan generation stage")
+        return "plan_generator"
+    elif current_stage == "content_generation" and plan_approved:
+        print("📝 Routing to system_agent_orchestrator for content generation stage")
+        return "system_agent_orchestrator"
+    else:
+        print("📋 Default routing to plan_generator")
+        return "plan_generator"
+
+# ------------------------ STAGE 1: PLAN GENERATION ------------------------
+graph.add_edge("plan_generator", "__end__")
+
+# ------------------------ STAGE 2: CONTENT GENERATION WORKFLOW ------------------------
+graph.add_edge("system_agent_orchestrator", "web_search_agent")
+graph.add_edge("web_search_agent", "prompt_optimization")
+graph.add_edge("prompt_optimization", "text_generator")
+# NOTE: Removed image_generator from flow - goes directly to content_reviewer
+graph.add_edge("text_generator", "content_reviewer")
+graph.add_edge("content_reviewer", "content_validator")
+
+# ------------------------ PHASE 3: SOCIAL MEDIA AGENTS WORKFLOW ------------------------
+graph.add_edge("content_validator", "social_media_agents_supervisor")
+
+def social_media_router(state: State) -> str:
+    """
+    FIXED Enhanced social media router with better debugging and post-specific routing.
+    """
+    current_post_id = state.get("current_post_id")
+    
+    print(f"🔄 Social Media Router: current_post_id='{current_post_id}'")
+    
+    if current_post_id:
+        platform = current_post_id.split('_')[0].lower()
+        if platform in PLATFORM_AGENT_MAP:
+            agent_name = f"create_{platform}_post"
+            print(f"🔄 Routing to {agent_name} for specific post: {current_post_id}")
+            return agent_name
+        else:
+            print(f"⚠️ Unknown platform '{platform}' in post_id: {current_post_id}")
+            return "__end__"
+    else:
+        # Default routing when no specific post is targeted
+        platforms = state.get("platforms", ["instagram"])
+        print(f"🔄 No specific post_id, using default platforms: {platforms}")
+        if "instagram" in platforms:
+            return "create_instagram_post"
+        elif "facebook" in platforms:
+            return "create_facebook_post"
+        elif "x" in platforms:
+            return "create_x_post"
+        elif "whatsapp" in platforms:
+            return "create_whatsapp_post"
+        elif "email" in platforms:
+            return "create_email_post"
+        elif "sms" in platforms:
+            return "create_sms_post"
+        else:
+            return "create_instagram_post"
+
+graph.add_conditional_edges(
+    "social_media_agents_supervisor",
+    social_media_router,
+    ["create_instagram_post", "create_facebook_post", "create_x_post",
+     "create_whatsapp_post", "create_email_post", "create_sms_post"]
+)
+
+# In regeneration mode, end after platform agent
+graph.add_edge("create_instagram_post", "__end__")
+graph.add_edge("create_facebook_post", "__end__")
+graph.add_edge("create_x_post", "__end__")
+graph.add_edge("create_whatsapp_post", "__end__")
+graph.add_edge("create_email_post", "__end__")
+graph.add_edge("create_sms_post", "__end__")
+
+# ------------------------ COMPILE ------------------------
+system_agents = graph.compile()
+
+
+
+# COMPLETE FIXED FEEDBACK API SECTION for src/api/api.py
+# Add this import at the top of your api.py if not already present:
+
+from .db_utils import (get_user_by_username, get_user_campaigns, get_campaign_by_name,
+                       get_collection_info, hybrid_search, insert_agentic_campaign_planner,
+                       update_agentic_campaign_planner, get_agentic_planner_record)  # <- ADD THIS
+
+# Replace the entire submit_feedback function with this FIXED version:
+
 @router.post("/{username}/{campaign_name}/feedback")
 async def submit_feedback(
     username: str,
@@ -6,9 +210,9 @@ async def submit_feedback(
 ) -> Dict[str, Any]:
     """
     FIXED Feedback batch regeneration (DB-backed):
-    - Properly handles is_regeneration flag to ensure correct routing
-    - Only regenerates the specific post_id provided in feedback
-    - Extracts content directly from agent response when campaign_plan structure fails
+    - Properly constructs state to preserve is_regeneration=True
+    - Only regenerates the specific post_id provided in feedback  
+    - Enhanced content extraction with dual methods
     """
     try:
         campaign_full_name = f"{username}/{campaign_name}"
@@ -253,11 +457,11 @@ async def submit_feedback(
             # CRITICAL FIX: Properly construct state to ensure is_regeneration=True
             logger.info(f"🔧 Constructing state for regeneration of {post_id}")
             
-            # Build base regeneration state first
+            # Build base regeneration state FIRST (with regeneration flags)
             base_regeneration_state = {
                 "stage": "content_generation",
                 "plan_approved": True,
-                "is_regeneration": True,  # CRITICAL: Set this first
+                "is_regeneration": True,           # ← Set this FIRST
                 "current_post_id": post_id,
                 "regen_attempt_number": version_number,
                 "human_feedback_text": fb_text,
@@ -275,14 +479,14 @@ async def submit_feedback(
 
             # Now merge with other state, but preserve regeneration settings
             state_input = {}
-            state_input.update(state_dict)  # Add stored state
-            state_input.update(feedback_dict)  # Add feedback tracking
-            state_input.update(base_regeneration_state)  # Override with regeneration settings
-            
+            state_input.update(state_dict)              # Add stored state
+            state_input.update(feedback_dict)           # Add feedback tracking  
+            state_input.update(base_regeneration_state) # Override with regeneration settings
+            state_input["base_plan_dict"] = state_dict.get("base_plan_dict", campaign_plan)
+
             # DOUBLE-CHECK: Ensure critical flags are preserved
             state_input["is_regeneration"] = True
             state_input["current_post_id"] = post_id
-            state_input["base_plan_dict"] = state_dict.get("base_plan_dict", campaign_plan)
 
             logger.info(f"🔧 State constructed: is_regeneration={state_input.get('is_regeneration')}, current_post_id='{state_input.get('current_post_id')}'")
 
@@ -558,7 +762,7 @@ async def submit_feedback(
 
 
 
-# ENHANCED social_media_agents.py with better content extraction
+# COMPLETE FIXED src/agent/campaign_agent/social_media_agents.py
 
 from typing import Dict, Any
 from src.models import State
@@ -854,196 +1058,3 @@ def create_email_post(state: State) -> Dict[str, Any]:
 def create_sms_post(state: State) -> Dict[str, Any]:
     """Agent that creates SMS posts using AWS Bedrock."""
     return create_social_media_post(state, "sms")
-
-
-
-# src/agent/graph.py
-
-from typing import Dict, Any
-from langgraph.graph import StateGraph
-from src.models import State
-
-from src.campaign_agent.system_agents import (
-    orchestrator_agent,
-    system_agent_orchestrator,
-    prompt_optimization,
-    text_generator,
-    content_reviewer,
-    plan_generator,
-    content_validator,
-    web_search_tool,
-    PLATFORM_AGENT_MAP
-)
-
-from src.agent.campaign_agent.social_media_agents import (
-    social_media_agents_supervisor,
-    create_instagram_post,
-    create_facebook_post,
-    create_x_post,
-    create_whatsapp_post,
-    create_email_post,
-    create_sms_post
-)
-
-# ------------------------ BUILD GRAPH ------------------------
-graph = StateGraph(State)
-
-# ------------------------ SYSTEM AGENT NODES ------------------------
-graph.add_node("orchestrator_agent", orchestrator_agent)
-graph.add_node("system_agent_orchestrator", system_agent_orchestrator)
-
-def web_search_agent(state: State) -> Dict[str, Any]:
-    """Web search agent that uses the web search tool."""
-    campaign_objective = state.get("campaign_objective", "")
-    campaign_description = state.get("campaign_description", "")
-    target_audience = state.get("target_audience", "")
-
-    search_query = f"{campaign_objective} {campaign_description} {target_audience} marketing campaign trends 2024"
-
-    try:
-        search_results = web_search_tool.invoke(search_query)
-        return {
-            "messages": [f"Web search completed for: {search_query[:100]}..."],
-            "current_step": "web_search_agent",
-            "search_results": search_results,
-            "search_query": search_query
-        }
-    except Exception as e:
-        return {
-            "messages": [f"Web search failed: {str(e)}"],
-            "current_step": "web_search_agent",
-            "search_results": "No web search results available",
-            "search_query": search_query
-        }
-
-graph.add_node("web_search_agent", web_search_agent)
-graph.add_node("prompt_optimization", prompt_optimization)
-graph.add_node("text_generator", text_generator)
-# NOTE: image_generator node completely removed
-graph.add_node("content_reviewer", content_reviewer)
-graph.add_node("plan_generator", plan_generator)
-graph.add_node("content_validator", content_validator)
-
-# ------------------------ SOCIAL MEDIA AGENT NODES ------------------------
-graph.add_node("social_media_agents_supervisor", social_media_agents_supervisor)
-graph.add_node("create_instagram_post", create_instagram_post)
-graph.add_node("create_facebook_post", create_facebook_post)
-graph.add_node("create_x_post", create_x_post)
-graph.add_node("create_whatsapp_post", create_whatsapp_post)
-graph.add_node("create_email_post", create_email_post)
-graph.add_node("create_sms_post", create_sms_post)
-
-# ------------------------ ENTRY POINT ------------------------
-graph.set_entry_point("orchestrator_agent")
-
-# ------------------------ REGENERATION ROUTER (FIXED) ------------------------
-def regeneration_router(state: State) -> str:
-    """
-    Enhanced regeneration router with proper debugging and validation.
-    """
-    is_regen = state.get("is_regeneration", False)
-    current_post_id = state.get("current_post_id", "")
-    
-    # Add comprehensive debugging
-    print(f"🔄 Router Debug: is_regeneration={is_regen}, current_post_id='{current_post_id}'")
-    print(f"🔄 Router Debug: stage={state.get('stage')}, plan_approved={state.get('plan_approved')}")
-    
-    if is_regen and current_post_id:
-        print(f"🔄 Regeneration mode detected: Routing directly to social media supervisor for {current_post_id}")
-        return "social_media_agents_supervisor"
-    else:
-        print("🔄 Normal mode: Proceeding to stage router")
-        return stage_router(state)
-
-graph.add_conditional_edges(
-    "orchestrator_agent",
-    regeneration_router,
-    {
-        "social_media_agents_supervisor": "social_media_agents_supervisor",
-        "plan_generator": "plan_generator",
-        "system_agent_orchestrator": "system_agent_orchestrator"
-    }
-)
-
-# ------------------------ STAGE ROUTING ------------------------
-def stage_router(state: State) -> str:
-    current_stage = state.get("stage", "plan_generation")
-    plan_approved = state.get("plan_approved", False)
-    print(f"🔄 Stage Router: current_stage={current_stage}, plan_approved={plan_approved}")
-    if current_stage == "plan_generation":
-        print("📋 Routing to plan_generator for plan generation stage")
-        return "plan_generator"
-    elif current_stage == "content_generation" and plan_approved:
-        print("📝 Routing to system_agent_orchestrator for content generation stage")
-        return "system_agent_orchestrator"
-    else:
-        print("📋 Default routing to plan_generator")
-        return "plan_generator"
-
-# ------------------------ STAGE 1: PLAN GENERATION ------------------------
-graph.add_edge("plan_generator", "__end__")
-
-# ------------------------ STAGE 2: CONTENT GENERATION WORKFLOW ------------------------
-graph.add_edge("system_agent_orchestrator", "web_search_agent")
-graph.add_edge("web_search_agent", "prompt_optimization")
-graph.add_edge("prompt_optimization", "text_generator")
-# NOTE: Removed image_generator from flow - goes directly to content_reviewer
-graph.add_edge("text_generator", "content_reviewer")
-graph.add_edge("content_reviewer", "content_validator")
-
-# ------------------------ PHASE 3: SOCIAL MEDIA AGENTS WORKFLOW ------------------------
-graph.add_edge("content_validator", "social_media_agents_supervisor")
-
-def social_media_router(state: State) -> str:
-    """
-    Enhanced social media router with better debugging and post-specific routing.
-    """
-    current_post_id = state.get("current_post_id")
-    
-    print(f"🔄 Social Media Router: current_post_id='{current_post_id}'")
-    
-    if current_post_id:
-        platform = current_post_id.split('_')[0].lower()
-        if platform in PLATFORM_AGENT_MAP:
-            agent_name = f"create_{platform}_post"
-            print(f"🔄 Routing to {agent_name} for specific post: {current_post_id}")
-            return agent_name
-        else:
-            print(f"⚠️ Unknown platform '{platform}' in post_id: {current_post_id}")
-            return "__end__"
-    else:
-        # Default routing when no specific post is targeted
-        platforms = state.get("platforms", ["instagram"])
-        print(f"🔄 No specific post_id, using default platforms: {platforms}")
-        if "instagram" in platforms:
-            return "create_instagram_post"
-        elif "facebook" in platforms:
-            return "create_facebook_post"
-        elif "x" in platforms:
-            return "create_x_post"
-        elif "whatsapp" in platforms:
-            return "create_whatsapp_post"
-        elif "email" in platforms:
-            return "create_email_post"
-        elif "sms" in platforms:
-            return "create_sms_post"
-        else:
-            return "create_instagram_post"
-
-graph.add_conditional_edges(
-    "social_media_agents_supervisor",
-    social_media_router,
-    ["create_instagram_post", "create_facebook_post", "create_x_post",
-     "create_whatsapp_post", "create_email_post", "create_sms_post"]
-)
-
-# In regeneration mode, end after platform agent
-graph.add_edge("create_instagram_post", "__end__")
-graph.add_edge("create_facebook_post", "__end__")
-graph.add_edge("create_x_post", "__end__")
-graph.add_edge("create_whatsapp_post", "__end__")
-graph.add_edge("create_email_post", "__end__")
-graph.add_edge("create_sms_post", "__end__")
-
-# ------------------------ COMPILE ------------------------
-system_agents = graph.compile()
